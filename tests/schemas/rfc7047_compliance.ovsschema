@@ -1,0 +1,318 @@
+{
+  "name": "RFC7047_Test",
+  "version": "1.0.0",
+  "cksum": "00000000 0",
+  "tables": {
+    "ScalarTypes": {
+      "isRoot": true,
+      "indexes": [["name"]],
+      "columns": {
+        "name": {
+          "type": "string"
+        },
+        "i": {
+          "type": "integer"
+        },
+        "r": {
+          "type": "real"
+        },
+        "b": {
+          "type": "boolean"
+        },
+        "s": {
+          "type": "string"
+        },
+        "u": {
+          "type": "uuid"
+        },
+        "enum_s": {
+          "type": {
+            "key": {
+              "type": "string",
+              "enum": ["set", ["a", "b", "c"]]
+            }
+          }
+        },
+        "limited_i": {
+          "type": {
+            "key": {
+              "type": "integer",
+              "minInteger": 0,
+              "maxInteger": 10
+            }
+          }
+        },
+        "limited_r": {
+          "type": {
+            "key": {
+              "type": "real",
+              "minReal": 0,
+              "maxReal": 10
+            }
+          }
+        },
+        "limited_s": {
+          "type": {
+            "key": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8
+            }
+          }
+        }
+      }
+    },
+    "SetTypes": {
+      "isRoot": true,
+      "indexes": [["name"]],
+      "columns": {
+        "name": {
+          "type": "string"
+        },
+        "ints": {
+          "type": {
+            "key": "integer",
+            "min": 0,
+            "max": "unlimited"
+          }
+        },
+        "strings": {
+          "type": {
+            "key": "string",
+            "min": 0,
+            "max": "unlimited"
+          }
+        },
+        "uuids": {
+          "type": {
+            "key": "uuid",
+            "min": 0,
+            "max": "unlimited"
+          }
+        },
+        "small_set": {
+          "type": {
+            "key": "string",
+            "min": 1,
+            "max": 2
+          }
+        }
+      }
+    },
+    "MapTypes": {
+      "isRoot": true,
+      "indexes": [["name"]],
+      "columns": {
+        "name": {
+          "type": "string"
+        },
+        "ss": {
+          "type": {
+            "key": "string",
+            "value": "string",
+            "min": 0,
+            "max": "unlimited"
+          }
+        },
+        "si": {
+          "type": {
+            "key": "string",
+            "value": "integer",
+            "min": 0,
+            "max": "unlimited"
+          }
+        },
+        "su": {
+          "type": {
+            "key": "string",
+            "value": "uuid",
+            "min": 0,
+            "max": "unlimited"
+          }
+        },
+        "small_map": {
+          "type": {
+            "key": "string",
+            "value": "string",
+            "min": 1,
+            "max": 2
+          }
+        }
+      }
+    },
+    "Root": {
+      "isRoot": true,
+      "indexes": [["name"]],
+      "columns": {
+        "name": {
+          "type": "string"
+        },
+        "child": {
+          "type": {
+            "key": {
+              "type": "uuid",
+              "refTable": "NonRoot",
+              "refType": "strong"
+            },
+            "min": 0,
+            "max": 1
+          }
+        }
+      }
+    },
+    "NonRoot": {
+      "isRoot": false,
+      "indexes": [["name"]],
+      "columns": {
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "StrongParent": {
+      "isRoot": true,
+      "indexes": [["name"]],
+      "columns": {
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "StrongChild": {
+      "isRoot": true,
+      "indexes": [["name"]],
+      "columns": {
+        "name": {
+          "type": "string"
+        },
+        "parent": {
+          "type": {
+            "key": {
+              "type": "uuid",
+              "refTable": "StrongParent",
+              "refType": "strong"
+            }
+          }
+        }
+      }
+    },
+    "WeakParent": {
+      "isRoot": true,
+      "indexes": [["name"]],
+      "columns": {
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "WeakChild": {
+      "isRoot": true,
+      "indexes": [["name"]],
+      "columns": {
+        "name": {
+          "type": "string"
+        },
+        "parent": {
+          "type": {
+            "key": {
+              "type": "uuid",
+              "refTable": "WeakParent",
+              "refType": "weak"
+            },
+            "min": 0,
+            "max": 1
+          }
+        }
+      }
+    },
+    "Indexed": {
+      "isRoot": true,
+      "indexes": [["tenant", "key"]],
+      "columns": {
+        "name": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        }
+      }
+    },
+    "MaxRows": {
+      "isRoot": true,
+      "maxRows": 1,
+      "columns": {
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "WeakMapChild": {
+      "isRoot": true,
+      "indexes": [["name"]],
+      "columns": {
+        "name": {
+          "type": "string"
+        },
+        "parents": {
+          "type": {
+            "key": "string",
+            "value": {
+              "type": "uuid",
+              "refTable": "WeakParent",
+              "refType": "weak"
+            },
+            "min": 0,
+            "max": "unlimited"
+          }
+        }
+      }
+    },
+    "NonRootMaxRows": {
+      "isRoot": false,
+      "maxRows": 1,
+      "columns": {
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "NonRootIndexed": {
+      "isRoot": false,
+      "indexes": [["name"]],
+      "columns": {
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "Readonly": {
+      "isRoot": true,
+      "indexes": [["name"]],
+      "columns": {
+        "name": {
+          "type": "string"
+        },
+        "immutable": {
+          "type": "string",
+          "mutable": false
+        }
+      }
+    },
+    "Ephemeral": {
+      "isRoot": true,
+      "indexes": [["name"]],
+      "columns": {
+        "name": {
+          "type": "string"
+        },
+        "temporary": {
+          "type": "string",
+          "ephemeral": true
+        }
+      }
+    }
+  }
+}

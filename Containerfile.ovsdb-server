@@ -1,0 +1,16 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends openvswitch-switch && \
+    rm -rf /var/lib/apt/lists/*
+
+# Prepare DB up front so ovsdb-server can start directly
+RUN ovsdb-tool create /etc/openvswitch/conf.db /usr/share/openvswitch/vswitch.ovsschema
+
+RUN mkdir -p /var/run/openvswitch
+
+EXPOSE 6640
+
+CMD ["ovsdb-server", "--remote=ptcp:6640:0.0.0.0", "--remote=punix:/var/run/openvswitch/db.sock", "--no-chdir", "/etc/openvswitch/conf.db"]

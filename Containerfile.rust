@@ -1,0 +1,25 @@
+FROM rust:1.85-bookworm AS build
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV RUST_BACKTRACE=1
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates git && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY . /workspace
+RUN cargo build --release --bin ovsdb
+
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /workspace/target/release/ovsdb /usr/local/bin/ovsdb
+
+ENTRYPOINT ["/usr/local/bin/ovsdb"]
+CMD ["--help"]
