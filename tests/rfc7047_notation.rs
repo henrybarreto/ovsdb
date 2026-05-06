@@ -18,13 +18,12 @@
 
 mod support;
 
-use anyhow::{Context, Result};
 use ovsdb::client::error::Error;
 use ovsdb::client::ops::Ops as ops;
 use ovsdb::client::{Row, TransactionOutcome, TransactionResponse};
 use serde_json::{json, Value};
 
-use support::{unique_name, TestOvsDBClient};
+use support::{unique_name, Context, Result, TestOvsDBClient};
 
 const RFC7047_SCHEMA_PATH: &str = "tests/schemas/rfc7047_compliance.ovsschema";
 const RFC7047_DB: &str = "RFC7047_Test";
@@ -40,7 +39,7 @@ fn select_rows(result: &TransactionResponse, index: usize) -> Result<&Vec<Row>> 
     result
         .get(index)
         .and_then(TransactionOutcome::rows)
-        .ok_or_else(|| anyhow::anyhow!("missing select rows at index {index}: {result:?}"))
+        .ok_or_else(|| err!("missing select rows at index {index}: {result:?}"))
 }
 
 fn assert_transact_error_or_validation(
@@ -54,12 +53,12 @@ fn assert_transact_error_or_validation(
             if outcome.error().is_some() {
                 Ok(())
             } else {
-                anyhow::bail!("expected transaction operation error, got {response:?}");
+                bail!("expected transaction operation error, got {response:?}");
             }
         }
         Err(Error::Validation(_)) => Ok(()),
         Err(Error::RpcError(_)) => Ok(()),
-        Err(other) => anyhow::bail!("expected validation or RPC error, got {other:?}"),
+        Err(other) => bail!("expected validation or RPC error, got {other:?}"),
     }
 }
 
@@ -93,7 +92,7 @@ fn assert_ovsdb_set_eq(actual: &Value, expected: &[Value]) -> Result<()> {
 fn map_pairs(value: &Value) -> Result<Vec<(Value, Value)>> {
     let arr = value.as_array().context("map must be JSON array")?;
     if arr.len() != 2 || arr.first() != Some(&json!("map")) {
-        anyhow::bail!("expected OVSDB map, got {value:?}");
+        bail!("expected OVSDB map, got {value:?}");
     }
 
     let pairs = arr
@@ -106,7 +105,7 @@ fn map_pairs(value: &Value) -> Result<Vec<(Value, Value)>> {
         .map(|pair| {
             let p = pair.as_array().context("map pair must be array")?;
             if p.len() != 2 {
-                anyhow::bail!("map pair must have length 2: {pair:?}");
+                bail!("map pair must have length 2: {pair:?}");
             }
             Ok((p[0].clone(), p[1].clone()))
         })

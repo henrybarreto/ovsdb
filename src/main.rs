@@ -3,10 +3,91 @@
 mod cli;
 
 use cli::{parse, Command, Handler};
+use ovsdb::client::error as client_error;
 use ovsdb::client::Connection as Client;
 use ovsdb::model::DatabaseSchema;
 use serde_json::{json, Value};
+use std::error::Error as StdError;
+use std::fmt::{self, Display, Formatter};
 use std::{collections::HashMap, io::Write, process::ExitCode};
+
+#[derive(Debug)]
+pub(crate) enum RunError {
+    ConvertRequiresMatchingSchema,
+    QueryTransactionMustBeArray,
+    MonitorCondSinceResultShape,
+    InvalidWaitState,
+    WaitTimedOut,
+    Cli(cli::CliError),
+    Client(client_error::Error),
+    Io(std::io::Error),
+    Json(serde_json::Error),
+    MissingTable { table: String },
+}
+
+impl Display for RunError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConvertRequiresMatchingSchema => {
+                f.write_str("convert requires matching schema version and checksum")
+            }
+            Self::QueryTransactionMustBeArray => {
+                f.write_str("query transaction must be a JSON array")
+            }
+            Self::MonitorCondSinceResultShape => {
+                f.write_str("monitor_cond_since result must be [found, last_id, table_updates]")
+            }
+            Self::InvalidWaitState => f.write_str("state must be added, connected, or removed"),
+            Self::WaitTimedOut => f.write_str("timed out waiting for database state"),
+            Self::Cli(err) => Display::fmt(err, f),
+            Self::Client(err) => Display::fmt(err, f),
+            Self::Io(err) => Display::fmt(err, f),
+            Self::Json(err) => Display::fmt(err, f),
+            Self::MissingTable { table } => write!(f, "table {table} not found"),
+        }
+    }
+}
+
+impl StdError for RunError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Cli(err) => Some(err),
+            Self::Client(err) => Some(err),
+            Self::Io(err) => Some(err),
+            Self::Json(err) => Some(err),
+            Self::ConvertRequiresMatchingSchema
+            | Self::QueryTransactionMustBeArray
+            | Self::MonitorCondSinceResultShape
+            | Self::InvalidWaitState
+            | Self::WaitTimedOut
+            | Self::MissingTable { .. } => None,
+        }
+    }
+}
+
+impl From<cli::CliError> for RunError {
+    fn from(err: cli::CliError) -> Self {
+        Self::Cli(err)
+    }
+}
+
+impl From<client_error::Error> for RunError {
+    fn from(err: client_error::Error) -> Self {
+        Self::Client(err)
+    }
+}
+
+impl From<std::io::Error> for RunError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl From<serde_json::Error> for RunError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::Json(err)
+    }
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -19,7 +100,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> anyhow::Result<()> {
+fn run() -> Result<(), RunError> {
     let (command, pretty) = parse()?;
     match command {
         Command::Client {
@@ -30,15 +111,12 @@ fn run() -> anyhow::Result<()> {
             let client = Client::connect(&server, tls.as_ref())?;
             run_handler(&client, *handler, pretty)?;
         }
-        Command::Server => {
-            anyhow::bail!("server subcommand is not implemented yet");
-        }
     }
 
     Ok(())
 }
 
-fn run_handler(client: &Client, handler: Handler, pretty: bool) -> anyhow::Result<()> {
+fn run_handler(client: &Client, handler: Handler, pretty: bool) -> Result<(), RunError> {
     match handler {
         Handler::ListDbs
         | Handler::GetSchema { .. }
@@ -59,31 +137,11 @@ fn run_handler(client: &Client, handler: Handler, pretty: bool) -> anyhow::Resul
         | Handler::Lock { .. }
         | Handler::Steal { .. }
         | Handler::Unlock { .. } => run_control(client, handler, pretty)?,
-        Handler::Dump {
-            database,
-            table,
-            columns,
-        } => {
-            let _ = (&database, &table, &columns);
-            anyhow::bail!("dump is not implemented yet")
-        }
-        Handler::Backup { database } => {
-            let _ = &database;
-            anyhow::bail!("backup is not implemented yet")
-        }
-        Handler::Restore {
-            force,
-            database,
-            snapshot,
-        } => {
-            let _ = (&force, &database, &snapshot);
-            anyhow::bail!("restore is not implemented yet")
-        }
     }
     Ok(())
 }
 
-fn run_read(client: &Client, handler: Handler, pretty: bool) -> anyhow::Result<()> {
+fn run_read(client: &Client, handler: Handler, pretty: bool) -> Result<(), RunError> {
     match handler {
         Handler::ListDbs => print_lines(&client.list_dbs()?),
         Handler::GetSchema { database } => print_json(&client.get_schema(&database)?, pretty)?,
@@ -127,7 +185,7 @@ fn run_read(client: &Client, handler: Handler, pretty: bool) -> anyhow::Result<(
     Ok(())
 }
 
-fn run_data(client: &Client, handler: Handler, pretty: bool) -> anyhow::Result<()> {
+fn run_data(client: &Client, handler: Handler, pretty: bool) -> Result<(), RunError> {
     match handler {
         Handler::Convert { schema } => handle_convert(client, &schema)?,
         Handler::NeedsConversion { schema } => handle_needs_conversion(client, &schema)?,
@@ -141,7 +199,7 @@ fn run_data(client: &Client, handler: Handler, pretty: bool) -> anyhow::Result<(
     Ok(())
 }
 
-fn run_monitor(client: &Client, handler: Handler, pretty: bool) -> anyhow::Result<()> {
+fn run_monitor(client: &Client, handler: Handler, pretty: bool) -> Result<(), RunError> {
     match handler {
         Handler::Monitor {
             database,
@@ -158,8 +216,8 @@ fn run_monitor(client: &Client, handler: Handler, pretty: bool) -> anyhow::Resul
             table,
             columns,
         } => {
-            let _ = &condition;
-            let initial = monitor_table(client, &database, &table, &columns)?;
+            let initial =
+                monitor_table_conditional(client, &database, &table, &columns, &condition, None)?;
             print_json(&initial, pretty)?;
             stream_monitor(client, pretty)?;
         }
@@ -170,8 +228,14 @@ fn run_monitor(client: &Client, handler: Handler, pretty: bool) -> anyhow::Resul
             table,
             columns,
         } => {
-            let _ = (&condition, &last_id);
-            let initial = monitor_table(client, &database, &table, &columns)?;
+            let initial = monitor_table_conditional(
+                client,
+                &database,
+                &table,
+                &columns,
+                &condition,
+                last_id.as_deref(),
+            )?;
             print_json(&initial, pretty)?;
             stream_monitor(client, pretty)?;
         }
@@ -180,7 +244,7 @@ fn run_monitor(client: &Client, handler: Handler, pretty: bool) -> anyhow::Resul
     Ok(())
 }
 
-fn run_control(client: &Client, handler: Handler, pretty: bool) -> anyhow::Result<()> {
+fn run_control(client: &Client, handler: Handler, pretty: bool) -> Result<(), RunError> {
     match handler {
         Handler::Wait { database, state } => {
             wait_for_database(client, &database, &state)?;
@@ -199,7 +263,7 @@ fn run_control(client: &Client, handler: Handler, pretty: bool) -> anyhow::Resul
     Ok(())
 }
 
-fn handle_convert(client: &Client, schema: &str) -> anyhow::Result<()> {
+fn handle_convert(client: &Client, schema: &str) -> Result<(), RunError> {
     let local_schema: DatabaseSchema = serde_json::from_value(load_schema_file(schema)?)?;
     let remote_schema = client.get_schema(&local_schema.name)?;
     if remote_schema.version == local_schema.version && remote_schema.cksum == local_schema.cksum {
@@ -207,11 +271,11 @@ fn handle_convert(client: &Client, schema: &str) -> anyhow::Result<()> {
         writeln!(stdout)?;
         Ok(())
     } else {
-        anyhow::bail!("convert is not implemented yet");
+        Err(RunError::ConvertRequiresMatchingSchema)
     }
 }
 
-fn handle_needs_conversion(client: &Client, schema: &str) -> anyhow::Result<()> {
+fn handle_needs_conversion(client: &Client, schema: &str) -> Result<(), RunError> {
     let local_schema: DatabaseSchema = serde_json::from_value(load_schema_file(schema)?)?;
     let remote_schema = client.get_schema(&local_schema.name)?;
     let mut stdout = std::io::stdout().lock();
@@ -223,11 +287,11 @@ fn handle_needs_conversion(client: &Client, schema: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
-fn handle_query(client: &Client, transaction: &str, pretty: bool) -> anyhow::Result<()> {
+fn handle_query(client: &Client, transaction: &str, pretty: bool) -> Result<(), RunError> {
     let mut transaction: Value = serde_json::from_str(transaction)?;
     let arr = transaction
         .as_array_mut()
-        .ok_or_else(|| anyhow::anyhow!("query transaction must be a JSON array"))?;
+        .ok_or(RunError::QueryTransactionMustBeArray)?;
     arr.push(json!({"op":"abort"}));
     let reply = client.request("transact", &transaction)?;
     if let Some(arr) = reply.as_array() {
@@ -242,11 +306,11 @@ fn handle_query(client: &Client, transaction: &str, pretty: bool) -> anyhow::Res
     Ok(())
 }
 
-fn wait_for_database(client: &Client, database: &str, state: &str) -> anyhow::Result<()> {
+fn wait_for_database(client: &Client, database: &str, state: &str) -> Result<(), RunError> {
     let want_present = matches!(state, "added" | "connected");
     let want_absent = state == "removed";
     if !want_present && !want_absent {
-        anyhow::bail!("state must be added, connected, or removed");
+        return Err(RunError::InvalidWaitState);
     }
 
     for _ in 0..60 {
@@ -258,7 +322,7 @@ fn wait_for_database(client: &Client, database: &str, state: &str) -> anyhow::Re
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    anyhow::bail!("timed out waiting for database state");
+    Err(RunError::WaitTimedOut)
 }
 
 fn monitor_table(
@@ -266,7 +330,7 @@ fn monitor_table(
     database: &str,
     table: &str,
     columns: &[String],
-) -> anyhow::Result<ovsdb::client::TableUpdates> {
+) -> Result<ovsdb::client::TableUpdates, RunError> {
     let monitor_id = format!("monitor-{}", client.next_id());
     let mut requests = HashMap::new();
     requests.insert(
@@ -284,14 +348,63 @@ fn monitor_table(
     Ok(client.monitor(database, &json!(monitor_id), &requests)?)
 }
 
-fn stream_monitor(client: &Client, pretty: bool) -> anyhow::Result<()> {
+fn monitor_table_conditional(
+    client: &Client,
+    database: &str,
+    table: &str,
+    columns: &[String],
+    condition: &str,
+    last_id: Option<&str>,
+) -> Result<ovsdb::client::TableUpdates, RunError> {
+    let monitor_id = format!("monitor-{}", client.next_id());
+    let where_clause: Value = serde_json::from_str(condition)?;
+    let mut requests = HashMap::new();
+    requests.insert(
+        table.to_string(),
+        json!([{
+            "columns": columns,
+            "where": where_clause,
+            "select": {
+                "initial": true,
+                "insert": true,
+                "delete": true,
+                "modify": true
+            }
+        }]),
+    );
+
+    let result = if let Some(last_id) = last_id {
+        client.request(
+            "monitor_cond_since",
+            &json!([database, monitor_id, requests, last_id]),
+        )?
+    } else {
+        client.request("monitor_cond", &json!([database, monitor_id, requests]))?
+    };
+    decode_conditional_monitor_result(result)
+}
+
+fn decode_conditional_monitor_result(
+    value: Value,
+) -> Result<ovsdb::client::TableUpdates, RunError> {
+    let updates_value = if let Some(arr) = value.as_array() {
+        arr.get(2)
+            .cloned()
+            .ok_or(RunError::MonitorCondSinceResultShape)?
+    } else {
+        value
+    };
+    Ok(serde_json::from_value(updates_value)?)
+}
+
+fn stream_monitor(client: &Client, pretty: bool) -> Result<(), RunError> {
     loop {
         let msg = client.poll_notification()?;
         print_json(&msg, pretty)?;
     }
 }
 
-fn load_schema_file(path: &str) -> anyhow::Result<Value> {
+fn load_schema_file(path: &str) -> Result<Value, RunError> {
     let data = std::fs::read_to_string(path)?;
     Ok(serde_json::from_str(&data)?)
 }
@@ -306,8 +419,10 @@ fn print_lines(lines: &[String]) {
 fn print_columns_for_table(
     table: Option<&ovsdb::model::TableSchema>,
     table_name: &str,
-) -> anyhow::Result<()> {
-    let table = table.ok_or_else(|| anyhow::anyhow!("table {table_name} not found"))?;
+) -> Result<(), RunError> {
+    let table = table.ok_or_else(|| RunError::MissingTable {
+        table: table_name.to_string(),
+    })?;
     let mut names: Vec<&String> = table.columns.keys().collect();
     names.sort();
     let mut stdout = std::io::stdout().lock();
@@ -317,7 +432,7 @@ fn print_columns_for_table(
     Ok(())
 }
 
-fn print_json<T: serde::Serialize>(value: &T, pretty: bool) -> anyhow::Result<()> {
+fn print_json<T: serde::Serialize>(value: &T, pretty: bool) -> Result<(), RunError> {
     let mut stdout = std::io::stdout().lock();
     if pretty {
         writeln!(stdout, "{}", serde_json::to_string_pretty(value)?)?;

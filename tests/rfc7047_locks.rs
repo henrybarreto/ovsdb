@@ -10,14 +10,13 @@
 
 mod support;
 
-use anyhow::Result;
 use ovsdb::client::error::Error;
 use ovsdb::client::ops::Ops as ops;
 use ovsdb::client::{Connection as Client, Notification, TransactionOutcome};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use support::{unique_name, RawJsonRpcStream, TestOvsDBClient};
+use support::{unique_name, RawJsonRpcStream, Result, TestOvsDBClient};
 
 const RFC7047_SCHEMA_PATH: &str = "tests/schemas/rfc7047_compliance.ovsschema";
 const RFC7047_DB: &str = "RFC7047_Test";
@@ -34,7 +33,7 @@ fn lock_id(prefix: &str) -> String {
 fn poll_notification(client: &Client) -> Result<Notification> {
     client
         .poll_notification_timeout(NOTIFICATION_TIMEOUT)?
-        .ok_or_else(|| anyhow::anyhow!("timeout waiting for lock notification"))
+        .ok_or_else(|| err!("timeout waiting for lock notification"))
 }
 
 fn expect_locked_notification(client: &Client, expected_lock: &str) -> Result<()> {
@@ -95,7 +94,7 @@ fn assert_not_owner_fails_assert(client: &Client, lock: &str) -> Result<()> {
                 "assert error string should not be empty"
             );
         }
-        other => anyhow::bail!("expected assert operation error, got {other:?}"),
+        other => bail!("expected assert operation error, got {other:?}"),
     }
 
     Ok(())
@@ -417,9 +416,9 @@ fn unlock_without_prior_lock_or_steal_fails_or_client_rejects() -> Result<()> {
     let result = tc.client.unlock(&lock);
 
     match result {
-        Ok(()) => anyhow::bail!("unlock without prior lock/steal should not succeed"),
+        Ok(()) => bail!("unlock without prior lock/steal should not succeed"),
         Err(Error::Validation(_) | Error::RpcError(_)) => Ok(()),
-        Err(other) => anyhow::bail!("unexpected error: {other:?}"),
+        Err(other) => bail!("unexpected error: {other:?}"),
     }
 }
 

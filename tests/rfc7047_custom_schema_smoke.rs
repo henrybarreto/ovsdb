@@ -18,10 +18,9 @@
 
 mod support;
 
-use anyhow::Result;
 use ovsdb::client::ops::Ops;
 use serde_json::{json, Value};
-use support::{unique_name, TestOvsDBClient};
+use support::{unique_name, Result, TestOvsDBClient};
 
 const RFC7047_SCHEMA_PATH: &str = "tests/schemas/rfc7047_compliance.ovsschema";
 const RFC7047_DB: &str = "RFC7047_Test";
@@ -147,7 +146,7 @@ fn custom_schema_typed_insert_then_select_scalar_row() -> Result<()> {
     let rows = select
         .get(0)
         .and_then(|outcome| outcome.rows())
-        .ok_or_else(|| anyhow::anyhow!("missing select rows in result: {select:?}"))?;
+        .ok_or_else(|| err!("missing select rows in result: {select:?}"))?;
 
     assert_eq!(rows.len(), 1);
     assert_eq!(
@@ -203,7 +202,7 @@ fn custom_schema_raw_transact_insert_scalar_row() -> Result<()> {
     let result = response
         .get("result")
         .and_then(Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("expected result array, got {response:?}"))?;
+        .ok_or_else(|| err!("expected result array, got {response:?}"))?;
 
     assert_eq!(result.len(), 1);
     assert!(

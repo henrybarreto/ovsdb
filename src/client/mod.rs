@@ -1,3 +1,101 @@
+//! OVSDB client API, notifications, and transaction helpers.
+//!
+//! This module provides:
+//!
+//! - connection management and request/response handling over `tcp:`, `unix:`,
+//!   `tls:`, and `ssl:` endpoints.
+//! - helpers to build and validate OVSDB transaction operations before sending
+//!   them.
+//! - typed models for transaction outcomes and asynchronous notifications.
+//! - TLS configuration for CA trust and optional mutual-auth client
+//!   certificates.
+//!
+//! # Usage
+//!
+//! Connect without TLS:
+//!
+//! ```ignore
+//! use ovsdb::client::Connection;
+//!
+//! let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+//! let dbs = client.list_dbs()?;
+//! println!("dbs: {dbs:?}");
+//! # Ok::<(), ovsdb::client::error::Error>(())
+//! ```
+//!
+//! Connect with TLS options:
+//!
+//! ```ignore
+//! use ovsdb::client::{tls, Connection};
+//! use std::path::PathBuf;
+//!
+//! let tls = tls::Options {
+//!     ca_cert: Some(PathBuf::from("/etc/ssl/certs/ovsdb-ca.pem")),
+//!     client_cert: Some(PathBuf::from("/etc/ssl/certs/client.pem")),
+//!     client_key: Some(PathBuf::from("/etc/ssl/private/client-key.pem")),
+//! };
+//!
+//! let client = Connection::connect("ssl:ovsdb.example.net:6640", Some(&tls))?;
+//! let schema = client.get_schema("OVN_Northbound")?;
+//! println!("schema version: {}", schema.version);
+//! # Ok::<(), ovsdb::client::error::Error>(())
+//! ```
+//!
+//! Full transaction + monitor flow:
+//!
+//! ```ignore
+//! use ovsdb::client::{ops::Ops, Connection, TransactionOutcome, TableUpdates};
+//! use serde_json::json;
+//! use std::collections::HashMap;
+//!
+//! let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+//!
+//! // 1) Read available DBs and schema metadata.
+//! let dbs = client.list_dbs()?;
+//! assert!(dbs.iter().any(|db| db == "Open_vSwitch"));
+//! let schema = client.get_schema("Open_vSwitch")?;
+//! println!("schema tables: {}", schema.tables.len());
+//!
+//! // 2) Build and run a transaction.
+//! let tx = vec![
+//!     Ops::comment("create bridge"),
+//!     Ops::insert("Bridge", json!({"name": "br-demo"}), Some("new_bridge")),
+//!     Ops::select("Bridge", &[json!(["name", "==", "br-demo"])], Some(&["name".to_string()])),
+//!     Ops::delete("Bridge", &[json!(["name", "==", "br-demo"])]),
+//! ];
+//!
+//! let reply = client.transact("Open_vSwitch", tx)?;
+//!
+//! // 3) Decode typed outcomes.
+//! for outcome in &reply.entries {
+//!     match outcome {
+//!         TransactionOutcome::Insert { uuid } => println!("inserted: {uuid}"),
+//!         TransactionOutcome::Select { rows } => println!("rows: {rows:?}"),
+//!         TransactionOutcome::Error(err) => println!("operation error: {err:?}"),
+//!         _ => {}
+//!     }
+//! }
+//!
+//! // 4) Start monitor (example shape).
+//! let mut requests = HashMap::new();
+//! requests.insert(
+//!     "Bridge".to_string(),
+//!     json!([{
+//!         "columns": ["name"],
+//!         "select": {
+//!             "initial": true,
+//!             "insert": true,
+//!             "delete": true,
+//!             "modify": true
+//!         }
+//!     }]),
+//! );
+//! let monitor_id = json!("docs-monitor");
+//! let initial: TableUpdates = client.monitor("Open_vSwitch", &monitor_id, &requests)?;
+//! println!("initial monitor tables: {}", initial.0.len());
+//! # Ok::<(), ovsdb::client::error::Error>(())
+//! ```
+
 /// Client-specific error types.
 pub mod error;
 /// Transaction operation builders and validators.
@@ -11,9 +109,9 @@ mod transport;
 use self::error::Error;
 use self::rpc::Validator;
 use self::tls as TLS;
-use crate::model::{DatabaseSchema, RpcError};
+use crate::model::{self, DatabaseSchema};
 use crate::strings::reject_null_bytes;
-use crossbeam_channel::{bounded, Sender};
+use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
 use serde::{Deserialize, Serialize};
@@ -39,6 +137,8 @@ pub struct Connection {
     notification_cond: Arc<(Mutex<bool>, Condvar)>,
     cancelled_requests: Arc<Mutex<HashSet<u64>>>,
     lock_states: Arc<Mutex<HashMap<String, LockState>>>,
+    schema_cache: Arc<Mutex<HashMap<String, DatabaseSchema>>>,
+    background_error: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +161,20 @@ pub struct TableUpdates(pub HashMap<String, HashMap<String, RowUpdate>>);
 
 impl TableUpdates {
     /// Return the update map for a table if it exists.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::{RowUpdate, TableUpdates};
+    /// use std::collections::HashMap;
+    ///
+    /// let updates = TableUpdates(HashMap::from([(
+    ///     "T".to_string(),
+    ///     HashMap::from([("row".to_string(), RowUpdate::default())]),
+    /// )]));
+    /// assert!(updates.get("T").is_some());
+    /// assert!(updates.get("missing").is_none());
+    /// ```
     pub fn get(&self, table: &str) -> Option<&HashMap<String, RowUpdate>> {
         self.0.get(table)
     }
@@ -79,11 +193,38 @@ pub struct RowUpdate {
 
 impl RowUpdate {
     /// Return the previous row value, if any.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::RowUpdate;
+    /// use serde_json::json;
+    ///
+    /// let update = serde_json::from_value::<RowUpdate>(json!({
+    ///     "old": {"name": "before"},
+    ///     "new": {"name": "after"}
+    /// }))
+    /// .expect("row update json");
+    /// assert!(update.old().is_some());
+    /// ```
     pub const fn old(&self) -> Option<&Row> {
         self.old.as_ref()
     }
 
     /// Return the new row value, if any.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::RowUpdate;
+    /// use serde_json::json;
+    ///
+    /// let update = serde_json::from_value::<RowUpdate>(json!({
+    ///     "new": {"name": "after"}
+    /// }))
+    /// .expect("row update json");
+    /// assert!(update.new_row().is_some());
+    /// ```
     pub const fn new_row(&self) -> Option<&Row> {
         self.new.as_ref()
     }
@@ -109,6 +250,15 @@ pub enum Notification {
 
 impl Notification {
     /// Return the RPC method name associated with the notification.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::Notification;
+    ///
+    /// let n = Notification::Locked("l1".to_string());
+    /// assert_eq!(n.method(), "locked");
+    /// ```
     pub fn method(&self) -> &str {
         match self {
             Self::Update { method, .. } => method,
@@ -118,6 +268,20 @@ impl Notification {
     }
 
     /// Return the monitor identifier if the notification carries one.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::{Notification, TableUpdates};
+    /// use std::collections::HashMap;
+    ///
+    /// let n = Notification::Update {
+    ///     method: "update".to_string(),
+    ///     monitor_id: "m1".to_string(),
+    ///     updates: TableUpdates(HashMap::new()),
+    /// };
+    /// assert_eq!(n.monitor_id().map(String::as_str), Some("m1"));
+    /// ```
     pub const fn monitor_id(&self) -> Option<&String> {
         match self {
             Self::Update { monitor_id, .. } => Some(monitor_id),
@@ -126,6 +290,15 @@ impl Notification {
     }
 
     /// Return the lock identifier if the notification carries one.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::Notification;
+    ///
+    /// let n = Notification::Stolen("lock-a".to_string());
+    /// assert_eq!(n.lock_id().map(String::as_str), Some("lock-a"));
+    /// ```
     pub const fn lock_id(&self) -> Option<&String> {
         match self {
             Self::Locked(lock_id) | Self::Stolen(lock_id) => Some(lock_id),
@@ -134,6 +307,20 @@ impl Notification {
     }
 
     /// Return the table updates if the notification carries them.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::{Notification, TableUpdates};
+    /// use std::collections::HashMap;
+    ///
+    /// let n = Notification::Update {
+    ///     method: "update".to_string(),
+    ///     monitor_id: "m1".to_string(),
+    ///     updates: TableUpdates(HashMap::new()),
+    /// };
+    /// assert!(n.updates().is_some());
+    /// ```
     pub const fn updates(&self) -> Option<&TableUpdates> {
         match self {
             Self::Update { updates, .. } => Some(updates),
@@ -151,16 +338,48 @@ pub struct TransactionResponse {
 
 impl TransactionResponse {
     /// Return the number of decoded outcomes.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::{TransactionOutcome, TransactionResponse};
+    ///
+    /// let response = TransactionResponse {
+    ///     entries: vec![TransactionOutcome::Empty],
+    /// };
+    /// assert_eq!(response.len(), 1);
+    /// ```
     pub const fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Return `true` when the response contains no outcomes.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::TransactionResponse;
+    ///
+    /// let response = TransactionResponse { entries: vec![] };
+    /// assert!(response.is_empty());
+    /// ```
     pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// Return the outcome at the given index, if present.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::{TransactionOutcome, TransactionResponse};
+    ///
+    /// let response = TransactionResponse {
+    ///     entries: vec![TransactionOutcome::Count { count: 2 }],
+    /// };
+    /// assert!(response.get(0).is_some());
+    /// assert!(response.get(1).is_none());
+    /// ```
     pub fn get(&self, idx: usize) -> Option<&TransactionOutcome> {
         self.entries.get(idx)
     }
@@ -187,13 +406,24 @@ pub enum TransactionOutcome {
     /// A successful operation with no payload.
     Empty,
     /// An operation-level error returned by the server.
-    Error(RpcError),
+    Error(model::rpc::Error),
     /// A null response entry.
     Null,
 }
 
 impl TransactionOutcome {
     /// Return the inserted UUID if this outcome is an insert.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::TransactionOutcome;
+    ///
+    /// let outcome = TransactionOutcome::Insert {
+    ///     uuid: "u".to_string(),
+    /// };
+    /// assert_eq!(outcome.uuid().map(String::as_str), Some("u"));
+    /// ```
     pub const fn uuid(&self) -> Option<&String> {
         match self {
             Self::Insert { uuid } => Some(uuid),
@@ -202,6 +432,17 @@ impl TransactionOutcome {
     }
 
     /// Return the selected rows if this outcome is a select.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::TransactionOutcome;
+    /// use serde_json::json;
+    ///
+    /// let rows = vec![serde_json::from_value(json!({"name":"r1"})).expect("row")];
+    /// let outcome = TransactionOutcome::Select { rows };
+    /// assert!(outcome.rows().is_some());
+    /// ```
     pub const fn rows(&self) -> Option<&Vec<Row>> {
         match self {
             Self::Select { rows } => Some(rows),
@@ -210,6 +451,15 @@ impl TransactionOutcome {
     }
 
     /// Return the count if this outcome is a count result.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::TransactionOutcome;
+    ///
+    /// let outcome = TransactionOutcome::Count { count: 3 };
+    /// assert_eq!(outcome.count(), Some(3));
+    /// ```
     pub const fn count(&self) -> Option<u64> {
         match self {
             Self::Count { count } => Some(*count),
@@ -218,7 +468,23 @@ impl TransactionOutcome {
     }
 
     /// Return the server error if this outcome is an error.
-    pub const fn error(&self) -> Option<&RpcError> {
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::TransactionOutcome;
+    /// use ovsdb::model::rpc;
+    /// use serde_json::json;
+    ///
+    /// let err: rpc::Error = serde_json::from_value(json!({
+    ///     "error": "not owner",
+    ///     "details": "lock mismatch"
+    /// }))
+    /// .expect("rpc error");
+    /// let outcome = TransactionOutcome::Error(err);
+    /// assert!(outcome.error().is_some());
+    /// ```
+    pub const fn error(&self) -> Option<&model::rpc::Error> {
         match self {
             Self::Error(error) => Some(error),
             _ => None,
@@ -226,6 +492,15 @@ impl TransactionOutcome {
     }
 
     /// Return `true` if this outcome is the empty variant.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::TransactionOutcome;
+    ///
+    /// assert!(TransactionOutcome::Empty.is_empty());
+    /// assert!(!TransactionOutcome::Null.is_empty());
+    /// ```
     pub const fn is_empty(&self) -> bool {
         matches!(self, Self::Empty)
     }
@@ -233,6 +508,16 @@ impl TransactionOutcome {
 
 impl Connection {
     /// Connect to an OVSDB endpoint over TCP, Unix socket, or TLS.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use ovsdb::client::Connection;
+    ///
+    /// let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+    /// # let _ = client;
+    /// # Ok::<(), ovsdb::client::error::Error>(())
+    /// ```
     ///
     /// # Errors
     ///
@@ -321,13 +606,38 @@ impl Connection {
             notification_cond: Arc::new((Mutex::new(false), Condvar::new())),
             cancelled_requests: Arc::new(Mutex::new(HashSet::new())),
             lock_states: Arc::new(Mutex::new(HashMap::new())),
+            schema_cache: Arc::new(Mutex::new(HashMap::new())),
+            background_error: Arc::new(Mutex::new(None)),
         };
 
         let reader = client.clone();
         std::thread::spawn(move || {
-            let _ = reader.background_read_loop();
+            if let Err(err) = reader.background_read_loop() {
+                if let Ok(mut bg) = reader.background_error.lock() {
+                    *bg = Some(err.to_string());
+                }
+
+                if let Ok(mut pending) = reader.pending_requests.lock() {
+                    pending.clear();
+                }
+
+                let (lock, cvar) = &*reader.notification_cond;
+                if let Ok(mut flag) = lock.lock() {
+                    *flag = true;
+                }
+                cvar.notify_all();
+            }
         });
         Ok(client)
+    }
+
+    fn fail_if_background_reader_stopped(&self) -> Result<(), Error> {
+        let bg = self.background_error.lock().map_err(|_| Error::Poisoned)?;
+        if let Some(message) = bg.as_ref() {
+            return Err(Error::BackgroundReadLoop(message.clone()));
+        }
+        drop(bg);
+        Ok(())
     }
 
     fn background_read_loop(&self) -> Result<(), Error> {
@@ -630,6 +940,7 @@ impl Connection {
     }
 
     fn request_with_id(&self, method: &str, params: &Value, id: u64) -> Result<Value, Error> {
+        self.fail_if_background_reader_stopped()?;
         rpc::Rpc::validate_method_params(method, params)?;
         let (tx, rx) = bounded(1);
         self.pending_requests
@@ -638,16 +949,51 @@ impl Connection {
             .insert(id, tx);
 
         let req = rpc::Rpc::encode(method, id, params.clone());
-        self.write_json_line(&req)?;
+        if let Err(err) = self.write_json_line(&req) {
+            let _ = self
+                .pending_requests
+                .lock()
+                .map_err(|_| Error::Poisoned)?
+                .remove(&id);
+            return Err(err);
+        }
 
-        let resp = rx
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| Error::Timeout)?;
+        let resp = match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(resp) => resp,
+            Err(RecvTimeoutError::Timeout) => {
+                let _ = self
+                    .pending_requests
+                    .lock()
+                    .map_err(|_| Error::Poisoned)?
+                    .remove(&id);
+                return Err(Error::Timeout);
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = self
+                    .pending_requests
+                    .lock()
+                    .map_err(|_| Error::Poisoned)?
+                    .remove(&id);
+                return Err(Error::ConnectionClosed);
+            }
+        };
 
         rpc::Rpc::decode(method, params, &resp)
     }
 
     /// Send a raw RPC request and return the decoded `result` payload.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use ovsdb::client::Connection;
+    /// use serde_json::json;
+    ///
+    /// let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+    /// let result = client.request("list_dbs", &json!([]))?;
+    /// println!("{result}");
+    /// # Ok::<(), ovsdb::client::error::Error>(())
+    /// ```
     ///
     /// # Errors
     ///
@@ -662,6 +1008,18 @@ impl Connection {
     /// This is intended for integration tests that need to coordinate a
     /// request with an external `cancel` notification.
     ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use ovsdb::client::Connection;
+    /// use serde_json::json;
+    ///
+    /// let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+    /// let result = client.request_with_id_for_test("echo", &json!(["hello"]), 100)?;
+    /// println!("{result}");
+    /// # Ok::<(), ovsdb::client::error::Error>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns validation, transport, timeout, or response-shape errors.
@@ -675,6 +1033,17 @@ impl Connection {
     }
 
     /// List the database names available on the server.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use ovsdb::client::Connection;
+    ///
+    /// let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+    /// let dbs = client.list_dbs()?;
+    /// assert!(!dbs.is_empty());
+    /// # Ok::<(), ovsdb::client::error::Error>(())
+    /// ```
     ///
     /// # Errors
     ///
@@ -692,20 +1061,98 @@ impl Connection {
             .collect::<Result<Vec<_>, _>>()
     }
 
-    /// Fetch and validate a database schema.
+    /// Fetch and validate a database schema, using an in-memory cache.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use ovsdb::client::Connection;
+    ///
+    /// let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+    /// let schema = client.get_schema("OVN_Northbound")?;
+    /// println!("version={}", schema.version);
+    /// # Ok::<(), ovsdb::client::error::Error>(())
+    /// ```
     ///
     /// # Errors
     ///
     /// Returns an error if the request fails, the schema cannot be parsed,
-    /// or the schema fails validation.
+    /// the schema fails validation, or the local cache lock is poisoned.
     pub fn get_schema(&self, database: &str) -> Result<DatabaseSchema, Error> {
+        let cached = {
+            let cache = self.schema_cache.lock().map_err(|_| Error::Poisoned)?;
+            cache.get(database).cloned()
+        };
+        if let Some(schema) = cached {
+            return Ok(schema);
+        }
+
+        self.refresh_schema(database)
+    }
+
+    /// Fetch and validate a database schema from the server and update cache.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use ovsdb::client::Connection;
+    ///
+    /// let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+    /// let schema = client.refresh_schema("OVN_Northbound")?;
+    /// println!("version={}", schema.version);
+    /// # Ok::<(), ovsdb::client::error::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, the schema cannot be parsed,
+    /// the schema fails validation, or the local cache lock is poisoned.
+    pub fn refresh_schema(&self, database: &str) -> Result<DatabaseSchema, Error> {
         let res = self.request("get_schema", &json!([database]))?;
         let schema: DatabaseSchema = serde_json::from_value(res)?;
         schema.validate().map_err(Error::Validation)?;
+        self.schema_cache
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .insert(database.to_string(), schema.clone());
         Ok(schema)
     }
 
+    /// Clear all cached schemas kept by this client.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use ovsdb::client::Connection;
+    ///
+    /// let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+    /// client.clear_schema_cache()?;
+    /// # Ok::<(), ovsdb::client::error::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the local cache lock is poisoned.
+    pub fn clear_schema_cache(&self) -> Result<(), Error> {
+        self.schema_cache
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .clear();
+        Ok(())
+    }
+
     /// Echo a string value through the server.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use ovsdb::client::Connection;
+    ///
+    /// let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+    /// let echoed = client.echo("hello")?;
+    /// assert_eq!(echoed, "hello");
+    /// # Ok::<(), ovsdb::client::error::Error>(())
+    /// ```
     ///
     /// # Errors
     ///
@@ -716,6 +1163,22 @@ impl Connection {
     }
 
     /// Run a transaction and decode the typed outcomes.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use ovsdb::client::{ops::Ops, Connection};
+    /// use serde_json::json;
+    ///
+    /// let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+    /// let tx = vec![
+    ///     Ops::comment("docs example"),
+    ///     Ops::select("Logical_Switch", &[], Some(&["name".to_string()])),
+    /// ];
+    /// let reply = client.transact("OVN_Northbound", tx)?;
+    /// println!("entries={}", reply.len());
+    /// # Ok::<(), ovsdb::client::error::Error>(())
+    /// ```
     ///
     /// # Errors
     ///
@@ -729,11 +1192,41 @@ impl Connection {
     }
 
     /// Allocate the next client request identifier.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use ovsdb::client::Connection;
+    ///
+    /// let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+    /// let id = client.next_id();
+    /// assert!(id > 0);
+    /// # Ok::<(), ovsdb::client::error::Error>(())
+    /// ```
     pub fn next_id(&self) -> u64 {
         self.id_counter.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Start a monitor and return the initial table updates.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use ovsdb::client::Connection;
+    /// use serde_json::json;
+    /// use std::collections::HashMap;
+    ///
+    /// let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+    /// let monitor_id = json!("docs-monitor");
+    /// let mut requests = HashMap::new();
+    /// requests.insert(
+    ///     "Logical_Switch".to_string(),
+    ///     json!([{"columns":["bridges"],"select":{"initial":true,"insert":true,"delete":true,"modify":true}}]),
+    /// );
+    /// let initial = client.monitor("OVN_Northbound", &monitor_id, &requests)?;
+    /// println!("{:?}", initial.get("Logical_Switch"));
+    /// # Ok::<(), ovsdb::client::error::Error>(())
+    /// ```
     ///
     /// # Errors
     ///
@@ -749,6 +1242,24 @@ impl Connection {
     }
 
     /// Start a conditional monitor and return the initial table updates.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use ovsdb::client::Connection;
+    /// use serde_json::json;
+    /// use std::collections::HashMap;
+    ///
+    /// let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+    /// let monitor_id = json!("docs-monitor-cond");
+    /// let mut requests = HashMap::new();
+    /// requests.insert(
+    ///     "Logical_Switch".to_string(),
+    ///     json!([{"columns":["name"],"where":[["name","==","br-int"]]}]),
+    /// );
+    /// let _initial = client.monitor_cond("OVN_Northbound", &monitor_id, &requests)?;
+    /// # Ok::<(), ovsdb::client::error::Error>(())
+    /// ```
     ///
     /// # Errors
     ///
@@ -768,6 +1279,21 @@ impl Connection {
 
     /// Cancel an active monitor.
     ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use ovsdb::client::Connection;
+    /// use serde_json::json;
+    /// use std::collections::HashMap;
+    ///
+    /// let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+    /// let monitor_id = json!("docs-cancel-monitor");
+    /// let requests = HashMap::from([("Logical_Switch".to_string(), json!([{}]))]);
+    /// let _ = client.monitor("OVN_Northbound", &monitor_id, &requests)?;
+    /// client.monitor_cancel(&monitor_id)?;
+    /// # Ok::<(), ovsdb::client::error::Error>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error if the request fails or the response is malformed.
@@ -777,6 +1303,16 @@ impl Connection {
     }
 
     /// Cancel a pending request by id.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use ovsdb::client::Connection;
+    ///
+    /// let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+    /// client.cancel(42)?;
+    /// # Ok::<(), ovsdb::client::error::Error>(())
+    /// ```
     ///
     /// # Errors
     ///
@@ -808,6 +1344,17 @@ impl Connection {
 
     /// Request a lock and return its granted state.
     ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use ovsdb::client::Connection;
+    ///
+    /// let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+    /// let acquired = client.lock("docs-lock")?;
+    /// println!("acquired={acquired}");
+    /// # Ok::<(), ovsdb::client::error::Error>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns validation, transport, timeout, or response-shape errors.
@@ -834,6 +1381,16 @@ impl Connection {
     }
 
     /// Steal a lock and return its granted state.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use ovsdb::client::Connection;
+    ///
+    /// let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+    /// let _ = client.steal("docs-lock")?;
+    /// # Ok::<(), ovsdb::client::error::Error>(())
+    /// ```
     ///
     /// # Errors
     ///
@@ -862,6 +1419,17 @@ impl Connection {
 
     /// Release a lock previously acquired with `lock` or `steal`.
     ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use ovsdb::client::Connection;
+    ///
+    /// let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+    /// let _ = client.lock("docs-lock")?;
+    /// client.unlock("docs-lock")?;
+    /// # Ok::<(), ovsdb::client::error::Error>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns validation, transport, timeout, or response-shape errors.
@@ -886,10 +1454,22 @@ impl Connection {
 
     /// Wait for and return the next queued notification.
     ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use ovsdb::client::Connection;
+    ///
+    /// let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+    /// let notif = client.poll_notification()?;
+    /// println!("method={}", notif.method());
+    /// # Ok::<(), ovsdb::client::error::Error>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error if a mutex is poisoned.
     pub fn poll_notification(&self) -> Result<Notification, Error> {
+        self.fail_if_background_reader_stopped()?;
         let (lock, cvar) = &*self.notification_cond;
         loop {
             {
@@ -902,12 +1482,25 @@ impl Connection {
             *pending = false;
             while !*pending {
                 pending = cvar.wait(pending).map_err(|_| Error::Poisoned)?;
+                self.fail_if_background_reader_stopped()?;
             }
             drop(pending);
         }
     }
 
     /// Wait for the next notification from the server, with a timeout.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use ovsdb::client::Connection;
+    /// use std::time::Duration;
+    ///
+    /// let client = Connection::connect("tcp:127.0.0.1:6640", None)?;
+    /// let maybe = client.poll_notification_timeout(Duration::from_secs(1))?;
+    /// println!("got={}", maybe.is_some());
+    /// # Ok::<(), ovsdb::client::error::Error>(())
+    /// ```
     ///
     /// # Errors
     ///
@@ -916,6 +1509,7 @@ impl Connection {
         &self,
         timeout: Duration,
     ) -> Result<Option<Notification>, Error> {
+        self.fail_if_background_reader_stopped()?;
         let (lock, cvar) = &*self.notification_cond;
         let start = std::time::Instant::now();
         loop {
@@ -935,6 +1529,7 @@ impl Connection {
                 .wait_timeout(pending, timeout.checked_sub(elapsed).unwrap_or_default())
                 .map_err(|_| Error::Poisoned)?;
             pending = new_pending;
+            self.fail_if_background_reader_stopped()?;
             if result.timed_out() {
                 let res = self
                     .notifications
@@ -952,9 +1547,11 @@ impl Connection {
 #[cfg(test)]
 mod client_tests {
     use super::*;
-    use crate::model::*;
+    use crate::model::{
+        AtomicType, BaseType, ColumnSchema, DatabaseSchema, MaxSize, TableSchema, Type,
+    };
     use crossbeam_channel::Receiver;
-    use ops::Ops;
+    use ops::{Datum, Transaction};
     use rpc::Rpc;
     use serde_json::json;
 
@@ -979,13 +1576,15 @@ mod client_tests {
         };
 
         // Scalar fallback
-        assert!(Ops::validate_datum(&typ, &json!(5)).is_ok());
-        assert!(Ops::validate_datum(&typ, &json!(11)).is_err());
+        assert!(Datum::new(&typ, &json!(5)).validate().is_ok());
+        assert!(Datum::new(&typ, &json!(11)).validate().is_err());
 
         // Set encoding
-        assert!(Ops::validate_datum(&typ, &json!(["set", [1, 2]])).is_ok());
-        assert!(Ops::validate_datum(&typ, &json!(["set", [1, 2, 3]])).is_err()); // max 2
-        assert!(Ops::validate_datum(&typ, &json!(["set", []])).is_err()); // min 1
+        assert!(Datum::new(&typ, &json!(["set", [1, 2]])).validate().is_ok());
+        assert!(Datum::new(&typ, &json!(["set", [1, 2, 3]]))
+            .validate()
+            .is_err()); // max 2
+        assert!(Datum::new(&typ, &json!(["set", []])).validate().is_err()); // min 1
     }
 
     #[test]
@@ -997,9 +1596,11 @@ mod client_tests {
             max: MaxSize::Unlimited("unlimited".to_string()),
         };
 
-        assert!(Ops::validate_datum(&typ, &json!(["map", [["a", "b"]]])).is_ok());
-        assert!(Ops::validate_datum(&typ, &json!(["set", ["a"]])).is_err());
-        assert!(Ops::validate_datum(&typ, &json!("a")).is_err());
+        assert!(Datum::new(&typ, &json!(["map", [["a", "b"]]]))
+            .validate()
+            .is_ok());
+        assert!(Datum::new(&typ, &json!(["set", ["a"]])).validate().is_err());
+        assert!(Datum::new(&typ, &json!("a")).validate().is_err());
     }
 
     #[test]
@@ -1036,7 +1637,7 @@ mod client_tests {
             "row": {"name": "foo"},
             "uuid-name": "row1"
         });
-        assert!(Ops::validate_transaction(&schema, &[insert_op]).is_ok());
+        assert!(Transaction::new(&schema, &[insert_op]).validate().is_ok());
 
         let update_op = json!({
             "op": "update",
@@ -1045,7 +1646,7 @@ mod client_tests {
             "row": {"name": "bar"}
         });
         // Update on immutable column should fail
-        assert!(Ops::validate_transaction(&schema, &[update_op]).is_err());
+        assert!(Transaction::new(&schema, &[update_op]).validate().is_err());
     }
 
     #[test]
@@ -1089,7 +1690,7 @@ mod client_tests {
                 ["labels", "insert", ["map", [["k1", "v1"]]]]
             ]
         });
-        assert!(Ops::validate_transaction(&schema, &[insert_map]).is_ok());
+        assert!(Transaction::new(&schema, &[insert_map]).validate().is_ok());
 
         let delete_map = json!({
             "op": "mutate",
@@ -1099,7 +1700,7 @@ mod client_tests {
                 ["labels", "delete", ["map", [["k1", "v1"]]]]
             ]
         });
-        assert!(Ops::validate_transaction(&schema, &[delete_map]).is_ok());
+        assert!(Transaction::new(&schema, &[delete_map]).validate().is_ok());
     }
 
     #[test]
@@ -1622,6 +2223,8 @@ mod client_tests {
             notification_cond: Arc::new((Mutex::new(false), Condvar::new())),
             cancelled_requests: Arc::new(Mutex::new(HashSet::new())),
             lock_states: Arc::new(Mutex::new(HashMap::new())),
+            schema_cache: Arc::new(Mutex::new(HashMap::new())),
+            background_error: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1659,7 +2262,7 @@ mod client_tests {
 
     #[test]
     #[allow(clippy::unnecessary_wraps)]
-    fn test_lock_and_unlock_state_gates_requests() -> anyhow::Result<()> {
+    fn test_lock_and_unlock_state_gates_requests() -> Result<(), Box<dyn std::error::Error>> {
         let client = test_client();
 
         let unlock_err = client.unlock("missing");

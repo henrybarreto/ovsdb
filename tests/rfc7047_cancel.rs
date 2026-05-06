@@ -9,14 +9,13 @@
 )]
 mod support;
 
-use anyhow::Result;
 use ovsdb::client::error::Error as OvsdbError;
 use ovsdb::client::ops::Ops as ops;
 use serde_json::{json, Value};
 use std::thread;
 use std::time::Duration;
 
-use support::{unique_name, RawJsonRpcStream, TestOvsDBClient};
+use support::{unique_name, RawJsonRpcStream, Result, TestOvsDBClient};
 
 const RFC7047_SCHEMA_PATH: &str = "tests/schemas/rfc7047_compliance.ovsschema";
 const RFC7047_DB: &str = "RFC7047_Test";
@@ -59,7 +58,7 @@ fn wait_transaction_with_id(
     client: &ovsdb::client::Connection,
     request_id: u64,
     row_name: &str,
-) -> Result<Value, OvsdbError> {
+) -> std::result::Result<Value, OvsdbError> {
     client.request_with_id_for_test(
         "transact",
         &json!([
@@ -131,7 +130,7 @@ fn cancel_outstanding_wait() -> Result<()> {
 
     let response = wait_thread
         .join()
-        .map_err(|_| anyhow::anyhow!("wait thread panicked"))?;
+        .map_err(|_| err!("wait thread panicked"))?;
 
     match response {
         Err(OvsdbError::RpcError(rpc_err)) => {
@@ -140,7 +139,7 @@ fn cancel_outstanding_wait() -> Result<()> {
                 "expected canceled error, got {rpc_err:?}"
             );
         }
-        other => anyhow::bail!("expected canceled wait error, got {other:?}"),
+        other => bail!("expected canceled wait error, got {other:?}"),
     }
 
     Ok(())
@@ -162,7 +161,7 @@ fn cancel_original_request_receives_canceled() -> Result<()> {
 
     let response = wait_thread
         .join()
-        .map_err(|_| anyhow::anyhow!("wait thread panicked"))?;
+        .map_err(|_| err!("wait thread panicked"))?;
 
     match response {
         Err(OvsdbError::RpcError(rpc_err)) => {
@@ -171,7 +170,7 @@ fn cancel_original_request_receives_canceled() -> Result<()> {
                 "expected canceled error, got {rpc_err:?}"
             );
         }
-        other => anyhow::bail!("expected canceled wait error, got {other:?}"),
+        other => bail!("expected canceled wait error, got {other:?}"),
     }
 
     let echoed = tc.client.echo("after-cancel")?;
@@ -287,7 +286,7 @@ fn connection_reusable_after_cancel() -> Result<()> {
 
     let canceled = wait_thread
         .join()
-        .map_err(|_| anyhow::anyhow!("wait thread panicked"))?;
+        .map_err(|_| err!("wait thread panicked"))?;
 
     match canceled {
         Err(OvsdbError::RpcError(rpc_err)) => {
@@ -296,7 +295,7 @@ fn connection_reusable_after_cancel() -> Result<()> {
                 "expected canceled error, got {rpc_err:?}"
             );
         }
-        other => anyhow::bail!("expected canceled wait error, got {other:?}"),
+        other => bail!("expected canceled wait error, got {other:?}"),
     }
 
     assert_eq!(tc.client.echo("alive")?, "alive");

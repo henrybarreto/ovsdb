@@ -13,6 +13,23 @@ pub(crate) struct Validator;
 
 impl Rpc {
     /// Encode an RPC request object with the provided method, id, and params.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::rpc::Rpc;
+    /// use serde_json::json;
+    ///
+    /// let req = Rpc::encode("echo", 7, json!(["ping"]));
+    /// assert_eq!(
+    ///     req,
+    ///     json!({
+    ///         "method": "echo",
+    ///         "id": 7,
+    ///         "params": ["ping"]
+    ///     })
+    /// );
+    /// ```
     pub fn encode<I, P>(method: &str, id: I, params: P) -> Value
     where
         I: Into<Value>,
@@ -35,6 +52,19 @@ impl Rpc {
     }
 
     /// Validate a sequence of transaction operations.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::rpc::Rpc;
+    /// use serde_json::json;
+    ///
+    /// let ok = vec![json!({"op": "comment", "comment": "hello"})];
+    /// assert!(Rpc::validate_transact_ops(&ok).is_ok());
+    ///
+    /// let bad = vec![json!({"op": "comment"})];
+    /// assert!(Rpc::validate_transact_ops(&bad).is_err());
+    /// ```
     ///
     /// # Errors
     ///
@@ -780,9 +810,9 @@ impl Validator {
             .is_some_and(|error| !error.is_null())
     }
 
-    pub(super) fn parse_rpc_error(value: Value) -> Result<crate::model::RpcError, Error> {
+    pub(super) fn parse_rpc_error(value: Value) -> Result<crate::model::rpc::Error, Error> {
         match value {
-            Value::String(error) => Ok(crate::model::RpcError {
+            Value::String(error) => Ok(crate::model::rpc::Error {
                 error,
                 details: None,
                 other: Map::new(),

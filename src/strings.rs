@@ -1,5 +1,14 @@
 /// Reject strings containing null bytes.
 ///
+/// # Examples
+///
+/// ```rust
+/// use ovsdb::strings::reject_null_bytes;
+///
+/// assert!(reject_null_bytes("tcp:127.0.0.1:6640").is_ok());
+/// assert!(reject_null_bytes("bad\0value").is_err());
+/// ```
+///
 /// # Errors
 ///
 /// Returns `Err` when the string contains a null byte.

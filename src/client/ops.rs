@@ -1,34 +1,134 @@
 use crate::model::{AtomicType, BaseType, DatabaseSchema, MaxSize, TableSchema, Type};
 use serde_json::{json, Value};
 
-/// Builders and validators for OVSDB transaction operations.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Ops;
+/// A datum plus its expected OVSDB type.
+#[derive(Debug, Clone, Copy)]
+pub struct Datum<'a> {
+    typ: &'a Type,
+    value: &'a Value,
+}
 
-impl Ops {
-    /// Validate a datum against an OVSDB type.
+impl<'a> Datum<'a> {
+    /// Create a datum validator.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::ops::Datum;
+    /// use ovsdb::model::{AtomicType, BaseType, Type};
+    /// use serde_json::json;
+    ///
+    /// let t = Type::Atomic(BaseType::Atomic(AtomicType::String));
+    /// let d = Datum::new(&t, &json!("ok"));
+    /// assert!(d.validate().is_ok());
+    /// ```
+    pub const fn new(typ: &'a Type, value: &'a Value) -> Self {
+        Self { typ, value }
+    }
+
+    /// Validate the datum against its type.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the datum shape or contents do not match the type.
-    pub fn validate_datum(typ: &Type, val: &Value) -> Result<(), String> {
-        match typ {
-            Type::Atomic(base) => base.validate(val),
+    /// Returns `Err` when the value does not conform to the expected type.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.typ {
+            Type::Atomic(base) => base.validate(self.value),
             Type::Complex {
                 key,
                 value: None,
                 min,
                 max,
-            } => Self::validate_set_datum(key, *min, max, val),
+            } => Ops::validate_set_datum(key, *min, max, self.value),
             Type::Complex {
                 key,
                 value: Some(map_value),
                 min,
                 max,
-            } => Self::validate_map_datum(key, map_value, *min, max, val),
+            } => Ops::validate_map_datum(key, map_value, *min, max, self.value),
         }
     }
+}
 
+/// A transaction plus the schema used to validate it.
+#[derive(Debug, Clone, Copy)]
+pub struct Transaction<'a> {
+    schema: &'a DatabaseSchema,
+    ops: &'a [Value],
+}
+
+impl<'a> Transaction<'a> {
+    /// Create a transaction validator.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::ops::{Ops, Transaction};
+    /// use ovsdb::model::{AtomicType, BaseType, ColumnSchema, DatabaseSchema, TableSchema, Type};
+    /// use serde_json::json;
+    /// use std::collections::HashMap;
+    ///
+    /// let schema = DatabaseSchema {
+    ///     name: "DB".to_string(),
+    ///     version: "1.0.0".to_string(),
+    ///     cksum: None,
+    ///     tables: HashMap::from([(
+    ///         "T".to_string(),
+    ///         TableSchema {
+    ///             columns: HashMap::from([(
+    ///                 "name".to_string(),
+    ///                 ColumnSchema {
+    ///                     r#type: Type::Atomic(BaseType::Atomic(AtomicType::String)),
+    ///                     ephemeral: None,
+    ///                     mutable: Some(true),
+    ///                 },
+    ///             )]),
+    ///             max_rows: None,
+    ///             is_root: None,
+    ///             indexes: None,
+    ///         },
+    ///     )]),
+    /// };
+    ///
+    /// let ops = vec![Ops::insert("T", json!({"name":"row1"}), None)];
+    /// let tx = Transaction::new(&schema, &ops);
+    /// assert!(tx.validate().is_ok());
+    /// ```
+    pub const fn new(schema: &'a DatabaseSchema, ops: &'a [Value]) -> Self {
+        Self { schema, ops }
+    }
+
+    /// Validate all operations against the schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when any operation has an invalid shape, references an
+    /// unknown table/column, or carries invalid datum/mutation values.
+    pub fn validate(&self) -> Result<(), String> {
+        for op in self.ops {
+            let obj = op.as_object().ok_or("op not object")?;
+            let table_name = obj
+                .get("table")
+                .and_then(Value::as_str)
+                .ok_or("table missing")?;
+            let table = self.schema.tables.get(table_name).ok_or("unknown table")?;
+            let op_name = obj.get("op").and_then(Value::as_str).ok_or("op missing")?;
+
+            match op_name {
+                "insert" | "update" => Ops::validate_row_operation(op_name, table, obj)?,
+                "mutate" => Ops::validate_mutations(table, obj)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Builders and validators for OVSDB transaction operations.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Ops;
+
+impl Ops {
     fn validate_set_datum(
         key: &BaseType,
         min: i64,
@@ -80,31 +180,6 @@ impl Ops {
             }
             _ => Err("map values MUST be encoded as [\"map\", [...]]".into()),
         }
-    }
-
-    /// Validate a transaction against a database schema.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when an operation references an unknown table, column,
-    /// or uses an invalid datum or mutation shape.
-    pub fn validate_transaction(schema: &DatabaseSchema, ops: &[Value]) -> Result<(), String> {
-        for op in ops {
-            let obj = op.as_object().ok_or("op not object")?;
-            let table_name = obj
-                .get("table")
-                .and_then(Value::as_str)
-                .ok_or("table missing")?;
-            let table = schema.tables.get(table_name).ok_or("unknown table")?;
-            let op_name = obj.get("op").and_then(Value::as_str).ok_or("op missing")?;
-
-            match op_name {
-                "insert" | "update" => Self::validate_row_operation(op_name, table, obj)?,
-                "mutate" => Self::validate_mutations(table, obj)?,
-                _ => {}
-            }
-        }
-        Ok(())
     }
 
     fn ensure_minimum_size(count: i64, min: i64) -> Result<(), String> {
@@ -163,7 +238,7 @@ impl Ops {
         if op_name == "update" && col.mutable == Some(false) {
             return Err(format!("column {col_name} is immutable"));
         }
-        Self::validate_datum(&col.r#type, val)
+        Datum::new(&col.r#type, val).validate()
     }
 
     fn validate_mutations(
@@ -336,6 +411,28 @@ impl Ops {
     }
 
     /// Build an `update` transaction operation.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::ops::Ops;
+    /// use serde_json::json;
+    ///
+    /// let op = Ops::update(
+    ///     "Logical_Switch",
+    ///     &[json!(["name", "==", "row-a"])],
+    ///     json!({"s":"updated"}),
+    /// );
+    /// assert_eq!(
+    ///     op,
+    ///     json!({
+    ///         "op": "update",
+    ///         "table": "Logical_Switch",
+    ///         "where": [["name", "==", "row-a"]],
+    ///         "row": {"s":"updated"}
+    ///     })
+    /// );
+    /// ```
     pub fn update(table: &str, r#where: &[Value], row: Value) -> Value {
         Self::op_object(
             "update",
@@ -348,6 +445,27 @@ impl Ops {
     }
 
     /// Build a `mutate` transaction operation.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::ops::Ops;
+    /// use serde_json::json;
+    ///
+    /// let set_insert = Ops::mutate(
+    ///     "Address_Set",
+    ///     &[json!(["name", "==", "row-a"])],
+    ///     &[json!(["strings", "insert", ["set", ["a", "b"]]])],
+    /// );
+    /// assert_eq!(set_insert["op"], "mutate");
+    ///
+    /// let map_delete = Ops::mutate(
+    ///     "Logical_Switch",
+    ///     &[json!(["name", "==", "row-a"])],
+    ///     &[json!(["ss", "delete", ["set", ["k1"]]])],
+    /// );
+    /// assert_eq!(map_delete["mutations"][0][1], "delete");
+    /// ```
     pub fn mutate(table: &str, r#where: &[Value], mutations: &[Value]) -> Value {
         Self::op_object(
             "mutate",
@@ -360,6 +478,24 @@ impl Ops {
     }
 
     /// Build a `wait` transaction operation.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::ops::Ops;
+    /// use serde_json::json;
+    ///
+    /// let op = Ops::wait(
+    ///     "Logical_Switch",
+    ///     &[json!(["name", "==", "row-a"])],
+    ///     &["s".to_string()],
+    ///     "==",
+    ///     &[json!({"s":"ready"})],
+    ///     Some(0),
+    /// );
+    /// assert_eq!(op["until"], "==");
+    /// assert_eq!(op["timeout"], 0);
+    /// ```
     pub fn wait(
         table: &str,
         r#where: &[Value],
@@ -382,26 +518,74 @@ impl Ops {
     }
 
     /// Build a `commit` transaction operation.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::ops::Ops;
+    /// let durable = Ops::commit(true);
+    /// assert_eq!(durable["op"], "commit");
+    /// assert_eq!(durable["durable"], true);
+    ///
+    /// let best_effort = Ops::commit(false);
+    /// assert_eq!(best_effort["durable"], false);
+    /// ```
     pub fn commit(durable: bool) -> Value {
         Self::op_object("commit", vec![("durable", json!(durable))])
     }
 
     /// Build an `abort` transaction operation.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::ops::Ops;
+    /// let op = Ops::abort();
+    /// assert_eq!(op, serde_json::json!({"op":"abort"}));
+    /// ```
     pub fn abort() -> Value {
         Self::op_object("abort", vec![])
     }
 
     /// Build a `comment` transaction operation.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::ops::Ops;
+    /// let op = Ops::comment("create bridge br-demo");
+    /// assert_eq!(op["op"], "comment");
+    /// assert_eq!(op["comment"], "create bridge br-demo");
+    /// ```
     pub fn comment(comment: &str) -> Value {
         Self::op_object("comment", vec![("comment", json!(comment))])
     }
 
     /// Build an `assert` transaction operation.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::ops::Ops;
+    /// let op = Ops::assert("global-lock");
+    /// assert_eq!(op, serde_json::json!({"op":"assert","lock":"global-lock"}));
+    /// ```
     pub fn assert(lock: &str) -> Value {
         Self::op_object("assert", vec![("lock", json!(lock))])
     }
 
     /// Build a `delete` transaction operation.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::ops::Ops;
+    /// use serde_json::json;
+    ///
+    /// let op = Ops::delete("Bridge", &[json!(["name", "==", "br-demo"])]);
+    /// assert_eq!(op["op"], "delete");
+    /// assert_eq!(op["where"], json!([["name", "==", "br-demo"]]));
+    /// ```
     pub fn delete(table: &str, r#where: &[Value]) -> Value {
         Self::op_object(
             "delete",
@@ -410,6 +594,28 @@ impl Ops {
     }
 
     /// Build an `insert` transaction operation.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::ops::Ops;
+    /// use serde_json::json;
+    ///
+    /// let op = Ops::insert(
+    ///     "Logical_Switch",
+    ///     json!({
+    ///         "name":"row-a",
+    ///         "i":1,
+    ///         "r":1.5,
+    ///         "b":true,
+    ///         "s":"hello"
+    ///     }),
+    ///     Some("row_uuid"),
+    /// );
+    /// assert_eq!(op["op"], "insert");
+    /// assert_eq!(op["table"], "Logical_Switch");
+    /// assert_eq!(op["uuid-name"], "row_uuid");
+    /// ```
     pub fn insert(table: &str, row: Value, uuid_name: Option<&str>) -> Value {
         let mut fields = vec![("table", json!(table)), ("row", row)];
         if let Some(uuid_name) = uuid_name {
@@ -419,6 +625,22 @@ impl Ops {
     }
 
     /// Build a `select` transaction operation.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::client::ops::Ops;
+    ///
+    /// use serde_json::json;
+    ///
+    /// let op = Ops::select(
+    ///     "Logical_Switch",
+    ///     &[json!(["name", "==", "row-a"])],
+    ///     Some(&["name".to_string(), "i".to_string()]),
+    /// );
+    /// assert_eq!(op["op"], "select");
+    /// assert_eq!(op["columns"], json!(["name", "i"]));
+    /// ```
     pub fn select(table: &str, r#where: &[Value], columns: Option<&[String]>) -> Value {
         let mut f = vec![("table", json!(table)), ("where", json!(r#where))];
         if let Some(c) = columns {
@@ -520,8 +742,12 @@ mod tests {
             min: 0,
             max: MaxSize::Unlimited("unlimited".to_string()),
         };
-        assert!(Ops::validate_datum(&set_type, &json!(["set", 1])).is_err());
-        assert!(Ops::validate_datum(&set_type, &json!(["set", ["a", "b"]])).is_ok());
+        assert!(Datum::new(&set_type, &json!(["set", 1]))
+            .validate()
+            .is_err());
+        assert!(Datum::new(&set_type, &json!(["set", ["a", "b"]]))
+            .validate()
+            .is_ok());
 
         let map_type = Type::Complex {
             key: BaseType::Atomic(AtomicType::String),
@@ -529,7 +755,11 @@ mod tests {
             min: 0,
             max: MaxSize::Unlimited("unlimited".to_string()),
         };
-        assert!(Ops::validate_datum(&map_type, &json!(["map", [["a"]]])).is_err());
-        assert!(Ops::validate_datum(&map_type, &json!(["map", [["a", "b"]]])).is_ok());
+        assert!(Datum::new(&map_type, &json!(["map", [["a"]]]))
+            .validate()
+            .is_err());
+        assert!(Datum::new(&map_type, &json!(["map", [["a", "b"]]]))
+            .validate()
+            .is_ok());
     }
 }

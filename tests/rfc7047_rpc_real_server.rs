@@ -18,11 +18,10 @@
 
 mod support;
 
-use anyhow::{Context, Result};
 use ovsdb::client::error::Error;
 use serde_json::json;
 
-use support::TestOvsDBClient;
+use support::{Context, Result, TestOvsDBClient};
 
 const OPEN_VSWITCH_DB: &str = "Open_vSwitch";
 const UNKNOWN_DB: &str = "does_not_exist";
@@ -87,7 +86,7 @@ fn get_schema_unknown_database_returns_rpc_error() -> Result<()> {
             assert_eq!(rpc_err.error, "unknown database");
         }
         other => {
-            anyhow::bail!("expected unknown database RpcError, got {other:?}");
+            bail!("expected unknown database RpcError, got {other:?}");
         }
     }
 
@@ -150,7 +149,7 @@ fn transact_unknown_database_returns_rpc_error() -> Result<()> {
             assert_eq!(rpc_err.error, "unknown database");
         }
         other => {
-            anyhow::bail!("expected unknown database RpcError, got {other:?}");
+            bail!("expected unknown database RpcError, got {other:?}");
         }
     }
 
@@ -184,7 +183,7 @@ fn transact_unknown_operation_is_operation_error() -> Result<()> {
             );
         }
         Err(other) => {
-            anyhow::bail!("unexpected error for unknown operation: {other:?}");
+            bail!("unexpected error for unknown operation: {other:?}");
         }
     }
 
@@ -219,7 +218,7 @@ fn transact_malformed_insert_rejected_or_operation_error() -> Result<()> {
         }
         Err(Error::Validation(_)) => {}
         Err(other) => {
-            anyhow::bail!("unexpected error for malformed insert: {other:?}");
+            bail!("unexpected error for malformed insert: {other:?}");
         }
     }
 

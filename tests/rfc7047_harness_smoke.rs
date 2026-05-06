@@ -9,9 +9,8 @@
 )]
 mod support;
 
-use anyhow::Result;
 use serde_json::json;
-use support::{read_raw_json, send_raw_json, TestOvsDBClient};
+use support::{read_raw_json, send_raw_json, Result, TestOvsDBClient};
 
 #[test]
 fn harness_starts_real_ovsdb_server() -> Result<()> {

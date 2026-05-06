@@ -1,9 +1,42 @@
 use clap::{Arg, ArgAction, Command as ClapCommand};
 use ovsdb::client::tls as TLS;
+use std::error::Error as StdError;
+use std::fmt::{self, Display, Formatter};
 use std::path::PathBuf;
 
 const DEFAULT_SERVER: &str = "unix:/run/openvswitch/db.sock";
 const DEFAULT_DATABASE: &str = "Open_vSwitch";
+
+#[derive(Debug)]
+pub enum CliError {
+    MismatchedClientTlsFlags,
+    MissingArgument { what: &'static str },
+    MonitorRequiresTable,
+    MonitorCondRequiresConditionAndTable,
+    MonitorCondSinceRequiresConditionAndTable,
+    UnknownCommand { name: String },
+}
+
+impl Display for CliError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MismatchedClientTlsFlags => {
+                f.write_str("both --client-cert and --client-key are required together")
+            }
+            Self::MissingArgument { what } => write!(f, "missing {what}"),
+            Self::MonitorRequiresTable => f.write_str("monitor requires a table name"),
+            Self::MonitorCondRequiresConditionAndTable => {
+                f.write_str("monitor-cond requires a condition and table")
+            }
+            Self::MonitorCondSinceRequiresConditionAndTable => {
+                f.write_str("monitor-cond-since requires a condition and table")
+            }
+            Self::UnknownCommand { name } => write!(f, "unknown command: {name}"),
+        }
+    }
+}
+
+impl StdError for CliError {}
 
 pub enum Handler {
     ListDbs,
@@ -34,19 +67,6 @@ pub enum Handler {
     },
     Query {
         transaction: String,
-    },
-    Dump {
-        database: String,
-        table: Option<String>,
-        columns: Vec<String>,
-    },
-    Backup {
-        database: String,
-    },
-    Restore {
-        force: bool,
-        database: String,
-        snapshot: String,
     },
     Monitor {
         database: String,
@@ -87,11 +107,10 @@ pub enum Command {
         handler: Box<Handler>,
         tls: Option<TLS::Options>,
     },
-    Server,
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn parse() -> anyhow::Result<(Command, bool)> {
+pub fn parse() -> Result<(Command, bool), CliError> {
     let matches = ClapCommand::new("ovsdb")
         .version(env!("CARGO_PKG_VERSION"))
         .about("Open vSwitch database JSON-RPC client")
@@ -106,7 +125,6 @@ pub fn parse() -> anyhow::Result<(Command, bool)> {
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(client())
-        .subcommand(server())
         .get_matches();
 
     let Some((root_name, root_matches)) = matches.subcommand() else {
@@ -119,7 +137,7 @@ pub fn parse() -> anyhow::Result<(Command, bool)> {
             let client_cert = matches.get_one::<PathBuf>("client-cert").cloned();
             let client_key = matches.get_one::<PathBuf>("client-key").cloned();
             if client_cert.is_some() ^ client_key.is_some() {
-                anyhow::bail!("both --client-cert and --client-key are required together");
+                return Err(CliError::MismatchedClientTlsFlags);
             }
             let tls = match (ca_cert, client_cert, client_key) {
                 (None, None, None) => None,
@@ -167,13 +185,14 @@ pub fn parse() -> anyhow::Result<(Command, bool)> {
                     .cloned()
                     .unwrap_or_else(|| default.to_string())
             };
-            let join_remaining = |slice: &[String], what: &str| -> anyhow::Result<String> {
-                match slice {
-                    [] => anyhow::bail!("missing {what}"),
-                    [single] => Ok(single.clone()),
-                    many => Ok(many.join(" ")),
-                }
-            };
+            let join_remaining =
+                |slice: &[String], what: &'static str| -> Result<String, CliError> {
+                    match slice {
+                        [] => Err(CliError::MissingArgument { what }),
+                        [single] => Ok(single.clone()),
+                        many => Ok(many.join(" ")),
+                    }
+                };
             let split_columns = |slice: &[String]| -> Vec<String> {
                 slice
                     .iter()
@@ -213,22 +232,9 @@ pub fn parse() -> anyhow::Result<(Command, bool)> {
                 "query" => Handler::Query {
                     transaction: join_remaining(rest, "transaction")?,
                 },
-                "dump" => Handler::Dump {
-                    database: first_or_default(rest, DEFAULT_DATABASE),
-                    table: rest.get(1).cloned(),
-                    columns: rest.iter().skip(2).cloned().collect(),
-                },
-                "backup" => Handler::Backup {
-                    database: first_or_default(rest, DEFAULT_DATABASE),
-                },
-                "restore" => Handler::Restore {
-                    force: sub_matches.get_flag("force"),
-                    database: first_or_default(rest, DEFAULT_DATABASE),
-                    snapshot: rest.get(1).cloned().unwrap_or_default(),
-                },
                 "monitor" => {
                     let (database, table, columns) = match rest {
-                        [] => anyhow::bail!("monitor requires a table name"),
+                        [] => return Err(CliError::MonitorRequiresTable),
                         [table] => (DEFAULT_DATABASE.to_string(), table.clone(), Vec::new()),
                         [database, table, tail @ ..] => {
                             (database.clone(), table.clone(), split_columns(tail))
@@ -242,7 +248,7 @@ pub fn parse() -> anyhow::Result<(Command, bool)> {
                 }
                 "monitor-cond" => {
                     let (database, condition, table, columns) = match rest {
-                        [] | [_] => anyhow::bail!("monitor-cond requires a condition and table"),
+                        [] | [_] => return Err(CliError::MonitorCondRequiresConditionAndTable),
                         [condition, table] => (
                             DEFAULT_DATABASE.to_string(),
                             condition.clone(),
@@ -266,7 +272,7 @@ pub fn parse() -> anyhow::Result<(Command, bool)> {
                 "monitor-cond-since" => {
                     let (database, last_id, condition, table, columns) = match rest {
                         [] | [_] => {
-                            anyhow::bail!("monitor-cond-since requires a condition and table")
+                            return Err(CliError::MonitorCondSinceRequiresConditionAndTable)
                         }
                         [condition, table] => (
                             DEFAULT_DATABASE.to_string(),
@@ -318,7 +324,11 @@ pub fn parse() -> anyhow::Result<(Command, bool)> {
                 "unlock" => Handler::Unlock {
                     lock_id: join_remaining(rest, "lock")?,
                 },
-                _ => anyhow::bail!("unknown command: {name}"),
+                _ => {
+                    return Err(CliError::UnknownCommand {
+                        name: name.to_string(),
+                    })
+                }
             };
 
             Command::Client {
@@ -327,8 +337,11 @@ pub fn parse() -> anyhow::Result<(Command, bool)> {
                 tls,
             }
         }
-        "server" => Command::Server,
-        _ => anyhow::bail!("unknown command: {root_name}"),
+        _ => {
+            return Err(CliError::UnknownCommand {
+                name: root_name.to_string(),
+            })
+        }
     };
 
     let pretty = matches.get_flag("pretty");
@@ -456,24 +469,6 @@ fn client() -> ClapCommand {
                         .allow_hyphen_values(true)
                         .trailing_var_arg(true),
                 ),
-            ClapCommand::new("dump")
-                .about("dump contents of TABLEs in DATABASE on SERVER to stdout")
-                .arg(
-                    Arg::new("args")
-                        .value_name("SERVER [DATABASE] [TABLE [COLUMN]...]")
-                        .num_args(0..)
-                        .allow_hyphen_values(true)
-                        .trailing_var_arg(true),
-                ),
-            ClapCommand::new("backup")
-                .about("dump database contents in the form of a database file")
-                .arg(
-                    Arg::new("args")
-                        .value_name("SERVER [DATABASE]")
-                        .num_args(0..)
-                        .allow_hyphen_values(true)
-                        .trailing_var_arg(true),
-                ),
             ClapCommand::new("monitor")
                 .about("monitor table contents and print updates as they arrive")
                 .arg(
@@ -537,26 +532,5 @@ fn client() -> ClapCommand {
                         .allow_hyphen_values(true)
                         .trailing_var_arg(true),
                 ),
-            ClapCommand::new("restore")
-                .about("restore database contents from a database file")
-                .arg(
-                    Arg::new("force")
-                        .long("force")
-                        .action(ArgAction::SetTrue)
-                        .help("proceed despite schema differences"),
-                )
-                .arg(
-                    Arg::new("args")
-                        .value_name("SERVER [DATABASE] [SNAPSHOT]")
-                        .num_args(0..)
-                        .allow_hyphen_values(true)
-                        .trailing_var_arg(true),
-                ),
         ])
-}
-
-fn server() -> ClapCommand {
-    ClapCommand::new("server")
-        .about("server-side commands")
-        .arg_required_else_help(false)
 }

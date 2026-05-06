@@ -1,9 +1,9 @@
 #![allow(missing_docs)]
 
-use anyhow::{Context, Result};
 use ovsdb::client::ops::Ops as ops;
 use ovsdb::model::DatabaseSchema;
 use serde_json::{json, Value};
+use std::error::Error as StdError;
 use std::{
     env,
     hint::black_box,
@@ -13,6 +13,61 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
+
+type Error = Box<dyn StdError + Send + Sync + 'static>;
+type Result<T> = std::result::Result<T, Error>;
+
+trait Context<T> {
+    fn context(self, message: impl std::fmt::Display) -> Result<T>;
+    fn with_context<F>(self, f: F) -> Result<T>
+    where
+        F: FnOnce() -> String;
+}
+
+impl<T, E> Context<T> for std::result::Result<T, E>
+where
+    E: std::fmt::Display + Send + Sync + 'static,
+{
+    fn context(self, message: impl std::fmt::Display) -> Result<T> {
+        self.map_err(|err| error(format!("{message}: {err}")))
+    }
+
+    fn with_context<F>(self, f: F) -> Result<T>
+    where
+        F: FnOnce() -> String,
+    {
+        self.map_err(|err| error(format!("{}: {err}", f())))
+    }
+}
+
+impl<T> Context<T> for Option<T> {
+    fn context(self, message: impl std::fmt::Display) -> Result<T> {
+        self.ok_or_else(|| error(message.to_string()))
+    }
+
+    fn with_context<F>(self, f: F) -> Result<T>
+    where
+        F: FnOnce() -> String,
+    {
+        self.ok_or_else(|| error(f()))
+    }
+}
+
+fn error(message: impl std::fmt::Display) -> Error {
+    std::io::Error::other(message.to_string()).into()
+}
+
+macro_rules! err {
+    ($($arg:tt)*) => {
+        error(format!($($arg)*))
+    };
+}
+
+macro_rules! bail {
+    ($($arg:tt)*) => {
+        return Err(err!($($arg)*))
+    };
+}
 
 static UNIQUE_SUFFIX: AtomicU64 = AtomicU64::new(1);
 const BENCH_ITERATIONS: u64 = 1000;
@@ -333,9 +388,9 @@ fn ensure_image() -> Result<()> {
         "-f",
         root.join(CONTAINERFILE)
             .to_str()
-            .ok_or_else(|| anyhow::anyhow!("invalid containerfile path"))?,
+            .ok_or_else(|| err!("invalid containerfile path"))?,
         root.to_str()
-            .ok_or_else(|| anyhow::anyhow!("invalid project root path"))?,
+            .ok_or_else(|| err!("invalid project root path"))?,
     ])
     .context("build ovsdb-server image")
 }
@@ -382,7 +437,7 @@ fn run_docker(args: &[&str]) -> Result<()> {
         return Ok(());
     }
 
-    Err(anyhow::anyhow!(
+    Err(err!(
         "docker {} failed: {}",
         args.join(" "),
         String::from_utf8_lossy(&output.stderr).trim()
@@ -421,7 +476,7 @@ fn run_client_output(binary: &PathBuf, args: &[&str]) -> Result<String> {
         return String::from_utf8(output.stdout).context("decode client output");
     }
 
-    Err(anyhow::anyhow!(
+    Err(err!(
         "{} {} failed: {}",
         binary.display(),
         args.join(" "),
@@ -452,14 +507,14 @@ fn resolve_rust_client_binary() -> Result<PathBuf> {
         .status()
         .context("build release ovsdb binary")?;
     if !status.success() {
-        anyhow::bail!("failed to build release ovsdb binary");
+        bail!("failed to build release ovsdb binary");
     }
 
     if release.exists() {
         return Ok(release);
     }
 
-    anyhow::bail!("could not find release ovsdb binary")
+    bail!("could not find release ovsdb binary")
 }
 
 impl ManagedContainer {
@@ -503,7 +558,7 @@ fn choose_writable_table(schema: &DatabaseSchema) -> Result<(String, String, Str
         return Ok((table_name.to_string(), identity, map_column));
     }
 
-    anyhow::bail!("no writable table found in schema")
+    bail!("no writable table found in schema")
 }
 
 fn unique_name(prefix: &str) -> String {

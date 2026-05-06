@@ -1,7 +1,7 @@
 #![allow(dead_code)]
-use anyhow::{Context, Result};
 use ovsdb::client::Connection as Client;
 use serde_json::Value;
+use std::fmt::Display;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -13,6 +13,63 @@ use testcontainers::{
     runners::{SyncBuilder, SyncRunner},
     Container, GenericBuildableImage, GenericImage, ImageExt,
 };
+
+pub type TestError = Box<dyn std::error::Error + Send + Sync + 'static>;
+pub type Result<T> = std::result::Result<T, TestError>;
+
+pub trait Context<T> {
+    fn context(self, message: impl Display) -> Result<T>;
+    fn with_context<F>(self, f: F) -> Result<T>
+    where
+        F: FnOnce() -> String;
+}
+
+impl<T, E> Context<T> for std::result::Result<T, E>
+where
+    E: Display + Send + Sync + 'static,
+{
+    fn context(self, message: impl Display) -> Result<T> {
+        self.map_err(|err| error(format!("{message}: {err}")))
+    }
+
+    fn with_context<F>(self, f: F) -> Result<T>
+    where
+        F: FnOnce() -> String,
+    {
+        self.map_err(|err| error(format!("{}: {err}", f())))
+    }
+}
+
+impl<T> Context<T> for Option<T> {
+    fn context(self, message: impl Display) -> Result<T> {
+        self.ok_or_else(|| error(message.to_string()))
+    }
+
+    fn with_context<F>(self, f: F) -> Result<T>
+    where
+        F: FnOnce() -> String,
+    {
+        self.ok_or_else(|| error(f()))
+    }
+}
+
+pub fn error(message: impl std::fmt::Display) -> TestError {
+    std::io::Error::other(message.to_string()).into()
+}
+
+#[macro_export]
+macro_rules! err {
+    ($($arg:tt)*) => {
+        $crate::support::error(format!($($arg)*))
+    };
+}
+
+#[macro_export]
+macro_rules! bail {
+    ($($arg:tt)*) => {
+        return Err($crate::support::error(format!($($arg)*)))
+    };
+}
 
 static OVSDB_IMAGE: OnceLock<GenericImage> = OnceLock::new();
 static UNIQUE_SUFFIX: AtomicU64 = AtomicU64::new(1);
@@ -82,7 +139,7 @@ fn connect_with_retry(addr: &str) -> Result<Client> {
         }
     }
 
-    Err(anyhow::anyhow!(
+    Err(err!(
         "failed to connect to ovsdb-server at {addr}: {last_err:?}"
     ))
 }
@@ -120,7 +177,7 @@ impl TestOvsDBClient {
     }
 
     pub fn start_tls() -> Result<Self> {
-        anyhow::bail!("TLS harness not implemented yet")
+        bail!("TLS harness not implemented yet")
     }
 
     pub fn start_with_schema(schema_path: &str, db_name: &str) -> Result<Self> {
@@ -129,7 +186,7 @@ impl TestOvsDBClient {
         let schema_abs = root.join(schema_path);
 
         if !schema_abs.exists() {
-            anyhow::bail!("schema file does not exist: {}", schema_abs.display());
+            bail!("schema file does not exist: {}", schema_abs.display());
         }
 
         let container = image
@@ -187,7 +244,7 @@ impl TestOvsDBClient {
                 vec!["sh", "-c", "cat /tmp/ovsdb-custom.log || true"],
             )
             .unwrap_or_default();
-            anyhow::bail!(
+            bail!(
                 "custom schema database {db_name:?} not found in list_dbs: {dbs:?}\nlogs:\n{logs}"
             );
         }
@@ -251,13 +308,13 @@ pub fn read_raw_json(stream: &mut TcpStream) -> Result<Value> {
         .context("read raw JSON-RPC response line")?;
 
     if line.is_empty() {
-        anyhow::bail!("connection closed before JSON-RPC response");
+        bail!("connection closed before JSON-RPC response");
     }
 
     let mut values = serde_json::Deserializer::from_str(&line).into_iter::<Value>();
     values
         .next()
-        .ok_or_else(|| anyhow::anyhow!("missing raw JSON-RPC response"))?
+        .ok_or_else(|| err!("missing raw JSON-RPC response"))?
         .context("parse raw JSON-RPC response")
 }
 
@@ -304,7 +361,7 @@ impl RawJsonRpcStream {
                 if err.is_eof() {
                     Ok(None)
                 } else {
-                    Err(anyhow::Error::new(err).context("parse raw JSON-RPC message"))
+                    Err(error(format!("parse raw JSON-RPC message: {err}")))
                 }
             }
             None => Ok(None),
@@ -323,7 +380,7 @@ impl RawJsonRpcStream {
                 .read(&mut temp)
                 .context("read raw JSON-RPC response bytes")?;
             if n == 0 {
-                anyhow::bail!("connection closed before JSON-RPC response");
+                bail!("connection closed before JSON-RPC response");
             }
             self.buf.extend_from_slice(&temp[..n]);
         }
@@ -362,7 +419,7 @@ impl RawJsonRpcStream {
         loop {
             let elapsed = start.elapsed();
             if elapsed >= timeout {
-                anyhow::bail!("timeout waiting for raw JSON-RPC response");
+                bail!("timeout waiting for raw JSON-RPC response");
             }
             let value = self.recv_timeout(timeout.saturating_sub(elapsed))?;
             if value.get("method").and_then(Value::as_str) == Some("echo") {

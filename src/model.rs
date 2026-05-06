@@ -4,16 +4,40 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 
-/// An OVSDB error object preserved from the server.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RpcError {
-    /// The server error name.
-    pub error: String,
-    /// Optional human-readable details from the server.
-    pub details: Option<String>,
-    /// Any additional fields returned by the server.
-    #[serde(flatten)]
-    pub other: serde_json::Map<String, Value>,
+/// OVSDB RPC model types.
+pub mod rpc {
+    use serde::{Deserialize, Serialize};
+    use serde_json::Value;
+
+    /// An OVSDB error object preserved from the server.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::model::rpc;
+    /// use serde_json::json;
+    ///
+    /// let err: rpc::Error = serde_json::from_value(json!({
+    ///     "error": "timed out",
+    ///     "details": "lock acquisition exceeded timeout",
+    ///     "severity": "warning"
+    /// }))
+    /// .expect("rpc error payload should parse");
+    ///
+    /// assert_eq!(err.error, "timed out");
+    /// assert_eq!(err.details.as_deref(), Some("lock acquisition exceeded timeout"));
+    /// assert_eq!(err.other.get("severity"), Some(&json!("warning")));
+    /// ```
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct Error {
+        /// The server error name.
+        pub error: String,
+        /// Optional human-readable details from the server.
+        pub details: Option<String>,
+        /// Any additional fields returned by the server.
+        #[serde(flatten)]
+        pub other: serde_json::Map<String, Value>,
+    }
 }
 
 /// A datum value used by OVSDB schemas and rows.
@@ -182,6 +206,15 @@ pub enum RefType {
 
 impl Type {
     /// Return the key/base type for this OVSDB type.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::model::{AtomicType, BaseType, Type};
+    ///
+    /// let t = Type::Atomic(BaseType::Atomic(AtomicType::String));
+    /// assert!(matches!(t.key(), BaseType::Atomic(AtomicType::String)));
+    /// ```
     pub const fn key(&self) -> &BaseType {
         match self {
             Self::Atomic(a) => a,
@@ -190,6 +223,20 @@ impl Type {
     }
 
     /// Validate the structural shape of the type declaration.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::model::{AtomicType, BaseType, MaxSize, Type};
+    ///
+    /// let t = Type::Complex {
+    ///     key: BaseType::Atomic(AtomicType::String),
+    ///     value: None,
+    ///     min: 0,
+    ///     max: MaxSize::Integer(1),
+    /// };
+    /// assert!(t.validate_shape().is_ok());
+    /// ```
     ///
     /// # Errors
     ///
@@ -225,6 +272,15 @@ impl Type {
 
 impl BaseType {
     /// Validate the structural shape of the base type declaration.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::model::{AtomicType, BaseType};
+    ///
+    /// let b = BaseType::Atomic(AtomicType::Integer);
+    /// assert!(b.validate_shape().is_ok());
+    /// ```
     ///
     /// # Errors
     ///
@@ -335,6 +391,15 @@ impl BaseType {
     }
 
     /// Return the underlying atomic type.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::model::{AtomicType, BaseType};
+    ///
+    /// let b = BaseType::Atomic(AtomicType::Uuid);
+    /// assert!(matches!(b.atomic_type(), AtomicType::Uuid));
+    /// ```
     pub const fn atomic_type(&self) -> &AtomicType {
         match self {
             Self::Atomic(a) => a,
@@ -343,6 +408,17 @@ impl BaseType {
     }
 
     /// Validate a value against this base type, including constraints.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::model::{AtomicType, BaseType};
+    /// use serde_json::json;
+    ///
+    /// let b = BaseType::Atomic(AtomicType::Boolean);
+    /// assert!(b.validate(&json!(true)).is_ok());
+    /// assert!(b.validate(&json!("true")).is_err());
+    /// ```
     ///
     /// # Errors
     ///
@@ -371,6 +447,17 @@ impl BaseType {
     }
 
     /// Validate a value against this base type without constraint checks.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::model::{AtomicType, BaseType};
+    /// use serde_json::json;
+    ///
+    /// let b = BaseType::Atomic(AtomicType::Integer);
+    /// assert!(b.validate_unconstrained(&json!(10)).is_ok());
+    /// assert!(b.validate_unconstrained(&json!("10")).is_err());
+    /// ```
     ///
     /// # Errors
     ///
@@ -506,6 +593,36 @@ impl BaseType {
 impl DatabaseSchema {
     /// Validate the schema definition for the database as a whole.
     ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::model::{AtomicType, BaseType, ColumnSchema, DatabaseSchema, TableSchema, Type};
+    /// use std::collections::HashMap;
+    ///
+    /// let schema = DatabaseSchema {
+    ///     name: "DB".to_string(),
+    ///     version: "1.0.0".to_string(),
+    ///     cksum: None,
+    ///     tables: HashMap::from([(
+    ///         "T".to_string(),
+    ///         TableSchema {
+    ///             columns: HashMap::from([(
+    ///                 "name".to_string(),
+    ///                 ColumnSchema {
+    ///                     r#type: Type::Atomic(BaseType::Atomic(AtomicType::String)),
+    ///                     ephemeral: None,
+    ///                     mutable: Some(true),
+    ///                 },
+    ///             )]),
+    ///             max_rows: None,
+    ///             is_root: None,
+    ///             indexes: None,
+    ///         },
+    ///     )]),
+    /// };
+    /// assert!(schema.validate().is_ok());
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns `Err` when the database name, version, table names, or table
@@ -549,6 +666,34 @@ impl DatabaseSchema {
 
 impl TableSchema {
     /// Validate a table schema against the enclosing database schema.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::model::{AtomicType, BaseType, ColumnSchema, DatabaseSchema, TableSchema, Type};
+    /// use std::collections::HashMap;
+    ///
+    /// let table = TableSchema {
+    ///     columns: HashMap::from([(
+    ///         "name".to_string(),
+    ///         ColumnSchema {
+    ///             r#type: Type::Atomic(BaseType::Atomic(AtomicType::String)),
+    ///             ephemeral: None,
+    ///             mutable: Some(true),
+    ///         },
+    ///     )]),
+    ///     max_rows: Some(10),
+    ///     is_root: Some(true),
+    ///     indexes: None,
+    /// };
+    /// let schema = DatabaseSchema {
+    ///     name: "DB".to_string(),
+    ///     version: "1.0.0".to_string(),
+    ///     cksum: None,
+    ///     tables: HashMap::new(),
+    /// };
+    /// assert!(table.validate(&schema, "T").is_ok());
+    /// ```
     ///
     /// # Errors
     ///
@@ -617,6 +762,26 @@ impl TableSchema {
 impl ColumnSchema {
     /// Validate a column schema against the enclosing database schema.
     ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::model::{AtomicType, BaseType, ColumnSchema, DatabaseSchema, Type};
+    /// use std::collections::HashMap;
+    ///
+    /// let column = ColumnSchema {
+    ///     r#type: Type::Atomic(BaseType::Atomic(AtomicType::String)),
+    ///     ephemeral: None,
+    ///     mutable: Some(true),
+    /// };
+    /// let schema = DatabaseSchema {
+    ///     name: "DB".to_string(),
+    ///     version: "1.0.0".to_string(),
+    ///     cksum: None,
+    ///     tables: HashMap::new(),
+    /// };
+    /// assert!(column.validate(&schema, "T", "name").is_ok());
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns `Err` when the type definition or referenced schema elements
@@ -645,6 +810,22 @@ impl ColumnSchema {
 
 impl BaseType {
     /// Validate base-type schema references against the enclosing schema.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ovsdb::model::{AtomicType, BaseType, DatabaseSchema};
+    /// use std::collections::HashMap;
+    ///
+    /// let base = BaseType::Atomic(AtomicType::Uuid);
+    /// let schema = DatabaseSchema {
+    ///     name: "DB".to_string(),
+    ///     version: "1.0.0".to_string(),
+    ///     cksum: None,
+    ///     tables: HashMap::new(),
+    /// };
+    /// assert!(base.validate_definition(&schema, "T", "c").is_ok());
+    /// ```
     ///
     /// # Errors
     ///

@@ -9,7 +9,6 @@
 )]
 mod support;
 
-use anyhow::{Context, Result};
 use ovsdb::client::error::Error;
 use ovsdb::client::ops::Ops as ops;
 use ovsdb::client::{Notification, RowUpdate, TableUpdates};
@@ -17,7 +16,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Duration;
 
-use support::{exec_text, unique_name, RawJsonRpcStream, TestOvsDBClient};
+use support::{exec_text, unique_name, Context, RawJsonRpcStream, Result, TestOvsDBClient};
 
 const RFC7047_SCHEMA_PATH: &str = "tests/schemas/rfc7047_compliance.ovsschema";
 const RFC7047_DB: &str = "RFC7047_Test";
@@ -78,6 +77,30 @@ fn monitor_all_events(columns: Vec<&str>) -> HashMap<String, Value> {
     monitor_request(Some(columns), true, true, true, true)
 }
 
+fn monitor_cond_request(columns: Option<Vec<&str>>, where_clause: Value) -> HashMap<String, Value> {
+    let mut request = serde_json::Map::new();
+    if let Some(columns) = columns {
+        request.insert(
+            "columns".to_string(),
+            json!(columns.into_iter().map(str::to_string).collect::<Vec<_>>()),
+        );
+    }
+    request.insert("where".to_string(), where_clause);
+    request.insert(
+        "select".to_string(),
+        json!({
+            "initial": true,
+            "insert": true,
+            "delete": true,
+            "modify": true
+        }),
+    );
+
+    let mut map = HashMap::new();
+    map.insert("ScalarTypes".to_string(), json!([Value::Object(request)]));
+    map
+}
+
 fn insert_scalar(tc: &TestOvsDBClient, name: &str) -> Result<()> {
     tc.client.transact(
         RFC7047_DB,
@@ -117,7 +140,7 @@ fn poll_update(tc: &TestOvsDBClient) -> Result<Notification> {
     let notif = tc
         .client
         .poll_notification_timeout(NOTIFICATION_TIMEOUT)?
-        .ok_or_else(|| anyhow::anyhow!("timeout waiting for monitor update"))?;
+        .ok_or_else(|| err!("timeout waiting for monitor update"))?;
 
     assert_eq!(notif.method(), "update");
 
@@ -477,9 +500,9 @@ fn monitor_duplicate_columns_fails() -> Result<()> {
     let result = tc.client.monitor(RFC7047_DB, &monitor_id, &requests);
 
     match result {
-        Ok(value) => anyhow::bail!("expected duplicate columns to fail, got {value:?}"),
+        Ok(value) => bail!("expected duplicate columns to fail, got {value:?}"),
         Err(Error::RpcError(_) | Error::Validation(_)) => Ok(()),
-        Err(other) => anyhow::bail!("unexpected error: {other:?}"),
+        Err(other) => bail!("unexpected error: {other:?}"),
     }
 }
 
@@ -507,9 +530,9 @@ fn monitor_overlapping_requests_same_table_fail() -> Result<()> {
     let result = tc.client.monitor(RFC7047_DB, &monitor_id, &requests);
 
     match result {
-        Ok(value) => anyhow::bail!("expected overlapping monitor columns to fail, got {value:?}"),
+        Ok(value) => bail!("expected overlapping monitor columns to fail, got {value:?}"),
         Err(Error::RpcError(_) | Error::Validation(_)) => Ok(()),
-        Err(other) => anyhow::bail!("unexpected error: {other:?}"),
+        Err(other) => bail!("unexpected error: {other:?}"),
     }
 }
 
@@ -558,7 +581,7 @@ fn monitor_cancel_unknown_monitor_fails() -> Result<()> {
             Ok(())
         }
         Err(Error::Validation(_)) => Ok(()),
-        other => anyhow::bail!("expected unknown monitor error, got {other:?}"),
+        other => bail!("expected unknown monitor error, got {other:?}"),
     }
 }
 
@@ -634,8 +657,85 @@ fn raw_update_notification_has_null_id_and_method_update() -> Result<()> {
 
     insert_handle
         .join()
-        .map_err(|_| anyhow::anyhow!("join raw insert thread failed"))?
+        .map_err(|_| err!("join raw insert thread failed"))?
         .context("raw insert transaction failed")?;
+
+    Ok(())
+}
+
+#[test]
+fn raw_monitor_cond_accepts_where_clause() -> Result<()> {
+    let tc = start_custom()?;
+    let name = unique_name("raw-monitor-cond");
+    insert_scalar(&tc, &name)?;
+
+    let stream = tc.raw_tcp_stream()?;
+    let read_half = stream.try_clone()?;
+    let write_half = stream;
+    let mut rpc = RawJsonRpcStream::new(read_half, write_half);
+
+    let monitor_id = "raw-monitor-cond";
+    let requests = monitor_cond_request(
+        Some(vec!["name", "s"]),
+        json!([["name", "==", name.as_str()]]),
+    );
+
+    rpc.send(&json!({
+        "method": "monitor_cond",
+        "params": [RFC7047_DB, monitor_id, requests],
+        "id": 1
+    }))?;
+
+    let response = rpc.recv_responding_to_echo_timeout(Duration::from_secs(20))?;
+    assert_eq!(response.get("id"), Some(&json!(1)));
+    assert_eq!(response.get("error"), Some(&json!(null)));
+    assert!(
+        response.get("result").is_some_and(Value::is_object),
+        "monitor_cond result should be a table-updates2 object: {response:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn raw_monitor_cond_since_request_shape_and_result() -> Result<()> {
+    let tc = start_custom()?;
+    let stream = tc.raw_tcp_stream()?;
+    let read_half = stream.try_clone()?;
+    let write_half = stream;
+    let mut rpc = RawJsonRpcStream::new(read_half, write_half);
+
+    let monitor_id = "raw-monitor-cond-since";
+    let requests = monitor_cond_request(Some(vec!["name", "s"]), json!([]));
+    let last_txn_id = "00000000-0000-0000-0000-000000000000";
+
+    rpc.send(&json!({
+        "method": "monitor_cond_since",
+        "params": [RFC7047_DB, monitor_id, requests, last_txn_id],
+        "id": 1
+    }))?;
+
+    let response = rpc.recv_responding_to_echo_timeout(Duration::from_secs(20))?;
+    assert_eq!(response.get("id"), Some(&json!(1)));
+    assert_eq!(response.get("error"), Some(&json!(null)));
+
+    let result = response
+        .get("result")
+        .and_then(Value::as_array)
+        .context("monitor_cond_since result should be [found, last_txn_id, table_updates2]")?;
+    assert_eq!(result.len(), 3);
+    assert!(
+        result.first().is_some_and(Value::is_boolean),
+        "monitor_cond_since result[0] should be bool found: {response:?}"
+    );
+    assert!(
+        result.get(1).is_some_and(Value::is_string),
+        "monitor_cond_since result[1] should be last transaction id: {response:?}"
+    );
+    assert!(
+        result.get(2).is_some_and(Value::is_object),
+        "monitor_cond_since result[2] should be table-updates2 object: {response:?}"
+    );
 
     Ok(())
 }

@@ -18,13 +18,12 @@
 
 mod support;
 
-use anyhow::Result;
 use ovsdb::client::error::Error;
 use ovsdb::client::ops::Ops as ops;
 use ovsdb::client::{TransactionOutcome, TransactionResponse};
 use serde_json::{json, Value};
 
-use support::{unique_name, TestOvsDBClient};
+use support::{unique_name, Result, TestOvsDBClient};
 
 const RFC7047_SCHEMA_PATH: &str = "tests/schemas/rfc7047_compliance.ovsschema";
 const RFC7047_DB: &str = "RFC7047_Test";
@@ -74,7 +73,7 @@ fn select_rows(result: &TransactionResponse, index: usize) -> Result<&Vec<ovsdb:
     result
         .get(index)
         .and_then(TransactionOutcome::rows)
-        .ok_or_else(|| anyhow::anyhow!("missing select rows at index {index}: {result:?}"))
+        .ok_or_else(|| err!("missing select rows at index {index}: {result:?}"))
 }
 
 fn expect_count(result: &TransactionResponse, index: usize, expected: i64) -> Result<()> {
@@ -83,7 +82,7 @@ fn expect_count(result: &TransactionResponse, index: usize, expected: i64) -> Re
             assert_eq!(*count as i64, expected);
             Ok(())
         }
-        other => anyhow::bail!("expected count {expected} at index {index}, got {other:?}"),
+        other => bail!("expected count {expected} at index {index}, got {other:?}"),
     }
 }
 
@@ -96,7 +95,7 @@ fn expect_operation_error(result: &TransactionResponse, index: usize) -> Result<
             );
             Ok(())
         }
-        other => anyhow::bail!("expected operation error at index {index}, got {other:?}"),
+        other => bail!("expected operation error at index {index}, got {other:?}"),
     }
 }
 
@@ -153,7 +152,7 @@ fn insert_wrong_type_fails() -> Result<()> {
     match result {
         Ok(result) => expect_operation_error(&result, 0)?,
         Err(Error::Validation(_)) => {}
-        Err(other) => anyhow::bail!("unexpected error: {other:?}"),
+        Err(other) => bail!("unexpected error: {other:?}"),
     }
 
     Ok(())
@@ -187,7 +186,7 @@ fn insert_enum_violation_fails() -> Result<()> {
     match result {
         Ok(result) => expect_operation_error(&result, 0)?,
         Err(Error::Validation(_)) => {}
-        Err(other) => anyhow::bail!("unexpected error: {other:?}"),
+        Err(other) => bail!("unexpected error: {other:?}"),
     }
 
     Ok(())
@@ -221,7 +220,7 @@ fn insert_constraint_violation_fails() -> Result<()> {
     match result {
         Ok(result) => expect_operation_error(&result, 0)?,
         Err(Error::Validation(_)) => {}
-        Err(other) => anyhow::bail!("unexpected error: {other:?}"),
+        Err(other) => bail!("unexpected error: {other:?}"),
     }
 
     Ok(())
@@ -276,7 +275,7 @@ fn select_unknown_column_fails() -> Result<()> {
     match result {
         Ok(result) => expect_operation_error(&result, 0)?,
         Err(Error::Validation(_)) => {}
-        Err(other) => anyhow::bail!("unexpected error: {other:?}"),
+        Err(other) => bail!("unexpected error: {other:?}"),
     }
 
     Ok(())
@@ -350,7 +349,7 @@ fn update_wrong_type_fails() -> Result<()> {
     match result {
         Ok(result) => expect_operation_error(&result, 1)?,
         Err(Error::Validation(_)) => {}
-        Err(other) => anyhow::bail!("unexpected error: {other:?}"),
+        Err(other) => bail!("unexpected error: {other:?}"),
     }
 
     Ok(())
@@ -383,7 +382,7 @@ fn update_mutable_false_column_fails() -> Result<()> {
     match result {
         Ok(result) => expect_operation_error(&result, 1)?,
         Err(Error::Validation(_)) => {}
-        Err(other) => anyhow::bail!("unexpected error: {other:?}"),
+        Err(other) => bail!("unexpected error: {other:?}"),
     }
 
     Ok(())
@@ -634,7 +633,7 @@ fn mutate_divide_by_zero_domain_error() -> Result<()> {
     match result {
         Ok(result) => expect_operation_error(&result, 1)?,
         Err(Error::Validation(_)) => {}
-        Err(other) => anyhow::bail!("unexpected error: {other:?}"),
+        Err(other) => bail!("unexpected error: {other:?}"),
     }
 
     Ok(())

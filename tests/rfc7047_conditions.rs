@@ -18,13 +18,12 @@
 
 mod support;
 
-use anyhow::Result;
 use ovsdb::client::error::Error;
 use ovsdb::client::ops::Ops as ops;
 use ovsdb::client::{TransactionOutcome, TransactionResponse};
 use serde_json::{json, Value};
 
-use support::{unique_name, TestOvsDBClient};
+use support::{unique_name, Result, TestOvsDBClient};
 
 const RFC7047_SCHEMA_PATH: &str = "tests/schemas/rfc7047_compliance.ovsschema";
 const RFC7047_DB: &str = "RFC7047_Test";
@@ -118,7 +117,7 @@ fn select_names(tc: &TestOvsDBClient, table: &str, conditions: &[Value]) -> Resu
     let rows = result
         .get(0)
         .and_then(TransactionOutcome::rows)
-        .ok_or_else(|| anyhow::anyhow!("missing select rows: {result:?}"))?;
+        .ok_or_else(|| err!("missing select rows: {result:?}"))?;
 
     let mut names = rows
         .iter()
@@ -141,7 +140,7 @@ fn expect_operation_error(result: &TransactionResponse, index: usize) -> Result<
             );
             Ok(())
         }
-        other => anyhow::bail!("expected operation error at index {index}, got {other:?}"),
+        other => bail!("expected operation error at index {index}, got {other:?}"),
     }
 }
 
@@ -159,7 +158,7 @@ fn select_with_bad_condition(
         Ok(response) => expect_operation_error(&response, 0),
         Err(Error::Validation(_)) => Ok(()),
         Err(Error::RpcError(_)) => Ok(()),
-        Err(other) => anyhow::bail!("unexpected error type: {other:?}"),
+        Err(other) => bail!("unexpected error type: {other:?}"),
     }
 }
 

@@ -18,12 +18,11 @@
 
 mod support;
 
-use anyhow::{Context, Result};
 use ovsdb::client::ops::Ops as ops;
 use ovsdb::client::{Row, TransactionOutcome, TransactionResponse};
 use serde_json::{json, Value};
 
-use support::{read_raw_json, send_raw_json, unique_name, TestOvsDBClient};
+use support::{read_raw_json, send_raw_json, unique_name, Context, Result, TestOvsDBClient};
 
 const RFC7047_SCHEMA_PATH: &str = "tests/schemas/rfc7047_compliance.ovsschema";
 const RFC7047_DB: &str = "RFC7047_Test";
@@ -89,7 +88,7 @@ fn select_rows(result: &TransactionResponse, index: usize) -> Result<&Vec<Row>> 
     result
         .get(index)
         .and_then(TransactionOutcome::rows)
-        .ok_or_else(|| anyhow::anyhow!("missing select rows at index {index}: {result:?}"))
+        .ok_or_else(|| err!("missing select rows at index {index}: {result:?}"))
 }
 
 fn assert_table_empty(tc: &TestOvsDBClient, table: &str, where_clause: &[Value]) -> Result<()> {
